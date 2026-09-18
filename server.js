@@ -6,13 +6,10 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 
-// ─── Daraja SDK ──────────────────────────────────
-const { SafaricomDarajaApi } = require('mds-daraja-sdk');
-
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ← ADDED: trust Render's reverse proxy so req.ip returns the real client IP
+// Trust Render's reverse proxy so req.ip returns the real client IP
 app.set('trust proxy', 1);
 
 /* -------------------------------
@@ -39,13 +36,13 @@ const transactionSchema = new mongoose.Schema({
     lastRetryAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 });
-// ← ADDED: indexes for fast lookups and pagination
+
+// Indexes for fast lookups and pagination
 transactionSchema.index({ createdAt: -1 });
 transactionSchema.index({ phone: 1, createdAt: -1 });
 transactionSchema.index({ status: 1, createdAt: -1 });
 transactionSchema.index({ checkout_id: 1 });
 transactionSchema.index({ merchant_request_id: 1 });
-
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
@@ -64,7 +61,7 @@ const allowedOrigins = [
     'https://fine-2zxp.onrender.com',
     'https://rentspace.co.ke',
     'https://www.rentspace.co.ke',
-    'https://saraha-pay-daraja.onrender.com'   // ← ADDED: allow the Render host itself
+    'https://saraha-pay-daraja.onrender.com'
 ];
 
 app.use(cors({
@@ -250,29 +247,18 @@ app.get("/", (req, res) => {
 });
 
 /* -------------------------------
-   9. Daraja SDK Initialization
+   9. Daraja Configuration
 -------------------------------- */
 const DARAJA_ENV = process.env.DARAJA_ENVIRONMENT || 'production';
 const DARAJA_BASE_URL = DARAJA_ENV === 'sandbox'
     ? 'https://sandbox.safaricom.co.ke'
     : 'https://api.safaricom.co.ke';
 
-const daraja = new SafaricomDarajaApi({
-    consumerKey: process.env.DARAJA_CONSUMER_KEY,
-    consumerSecret: process.env.DARAJA_CONSUMER_SECRET,
-    shortCode: process.env.DARAJA_SHORTCODE,
-    passkey: process.env.DARAJA_PASSKEY,
-    baseUrl: DARAJA_BASE_URL
-});
-
 console.log(`📍 Daraja Environment: ${DARAJA_ENV}`);
 console.log(`📍 Daraja Base URL: ${DARAJA_BASE_URL}`);
 console.log(`📍 Daraja Shortcode: ${process.env.DARAJA_SHORTCODE}`);
-console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);   // ← ADDED: log callback for easy verification
+console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);
 
-/* -------------------------------
-   10. Helper: Initiate STK Push (via SDK)
--------------------------------- */
 /* -------------------------------
    10. Helper: Initiate STK Push (Direct API)
 -------------------------------- */
@@ -311,7 +297,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 
     // 4. Build the STK Push Request
     const accountRef = `PAY-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    
+
     console.log("📤 Daraja STK Request (Direct API):", {
         phone: formattedPhone,
         amount: Math.round(parseFloat(amount)),
@@ -328,7 +314,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         PartyA: formattedPhone,
         PartyB: process.env.DARAJA_SHORTCODE,
         PhoneNumber: formattedPhone,
-        CallBackURL: process.env.DARAJA_CALLBACK_URL, // Note: capital B and URL
+        CallBackURL: process.env.DARAJA_CALLBACK_URL,
         AccountReference: accountRef,
         TransactionDesc: (name || 'Sarahapay').substring(0, 13)
     };
@@ -505,21 +491,16 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 /* -------------------------------
-   13. Fetch Transactions
--------------------------------- */
-/* -------------------------------
    13. Fetch Transactions (paginated)
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
-        // Query params
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
         const status = (req.query.status || '').toUpperCase();
         const phone = (req.query.phone || '').trim();
         const search = (req.query.search || '').trim();
 
-        // Build filter
         const filter = {};
         if (status && ['PENDING', 'SUCCESS', 'FAILED', 'CANCELLED'].includes(status)) {
             filter.status = status;
@@ -528,7 +509,6 @@ app.get("/api/transactions", async (req, res) => {
             filter.phone = phone.replace(/\s+/g, '');
         }
         if (search) {
-            // Case-insensitive search across name/phone/receipt
             filter.$or = [
                 { name: { $regex: search, $options: 'i' } },
                 { phone: { $regex: search, $options: 'i' } },
@@ -539,7 +519,6 @@ app.get("/api/transactions", async (req, res) => {
 
         const skip = (page - 1) * limit;
 
-        // Run count + fetch in parallel
         const [total, transactions] = await Promise.all([
             Transaction.countDocuments(filter),
             Transaction.find(filter)
@@ -613,17 +592,14 @@ app.post("/callback", async (req, res) => {
             console.log(`📊 ResultCode: ${resultCode}, Desc: ${resultDesc}`);
             console.log(`📊 CheckoutRequestID: ${checkoutId}`);
 
-            // Extract metadata (only present on success)
             const items = callback.CallbackMetadata?.Item || [];
             const getItem = (name) => items.find(i => i.Name === name)?.Value;
             const receipt = getItem('MpesaReceiptNumber');
             const phone = getItem('PhoneNumber');
             const amount = getItem('Amount');
 
-            // Determine status
-            const status = resultCode === 0 ? 'SUCCESS' : 'FAILED';
+            const status = Number(resultCode) === 0 ? 'SUCCESS' : 'FAILED';
 
-            // Find transaction
             let transaction = null;
 
             if (checkoutId) {
@@ -649,7 +625,6 @@ app.post("/callback", async (req, res) => {
                 return;
             }
 
-            // Update transaction
             transaction.status = status;
             transaction.result_code = resultCode;
             transaction.result_desc = resultDesc;
@@ -659,7 +634,6 @@ app.post("/callback", async (req, res) => {
             await transaction.save();
             console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
 
-            // Forward on success
             if (status === 'SUCCESS') {
                 const callbackPayload = {
                     checkout_id: transaction.checkout_id,
@@ -671,8 +645,7 @@ app.post("/callback", async (req, res) => {
                     reference: checkoutId
                 };
 
-                // ── Forward to FineEscorts ─────────────────────
-                // ← CHANGED: now reads from env with a sensible fallback
+                // Forward to FineEscorts
                 const fineEscortsUrl = process.env.FINEESCORTS_WEBHOOK_URL
                     || 'https://fineescorts.co.ke/payment-callback';
 
@@ -695,8 +668,7 @@ app.post("/callback", async (req, res) => {
                     console.error('❌ Failed to forward callback to FineEscorts:', err.message);
                 }
 
-                // ── Forward to RentSpace (supports comma-separated URLs) ──
-                // ← CHANGED: fixed "markeplace" → "marketplace" typo in fallback URL
+                // Forward to RentSpace (supports comma-separated URLs)
                 const webhookUrls = (process.env.RENTSPACE_WEBHOOK_URL
                     || 'https://rentspace-marketplace.onrender.com/api/subscriptions/saraha-webhook')
                     .split(',')
