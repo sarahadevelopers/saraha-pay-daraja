@@ -491,6 +491,64 @@ app.post("/api/retry-payment", async (req, res) => {
 });
 
 /* -------------------------------
+   12b. Query STK Push Status
+-------------------------------- */
+app.post("/api/query-stk", async (req, res) => {
+    try {
+        const { checkoutRequestId } = req.body;
+        if (!checkoutRequestId) {
+            return res.status(400).json({ error: "checkoutRequestId required" });
+        }
+
+        // 1. Get OAuth Access Token
+        const auth = Buffer.from(
+            `${process.env.DARAJA_CONSUMER_KEY}:${process.env.DARAJA_CONSUMER_SECRET}`
+        ).toString('base64');
+
+        const tokenRes = await axios.get(
+            `${DARAJA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
+            { headers: { Authorization: `Basic ${auth}` } }
+        );
+        const accessToken = tokenRes.data.access_token;
+
+        // 2. Generate Timestamp and Password
+        const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+        const password = Buffer.from(
+            `${process.env.DARAJA_SHORTCODE}${process.env.DARAJA_PASSKEY}${timestamp}`
+        ).toString('base64');
+
+        // 3. Query the status
+        const queryPayload = {
+            BusinessShortCode: process.env.DARAJA_SHORTCODE,
+            Password: password,
+            Timestamp: timestamp,
+            CheckoutRequestID: checkoutRequestId
+        };
+
+        const queryRes = await axios.post(
+            `${DARAJA_BASE_URL}/mpesa/stkpushquery/v1/query`,
+            queryPayload,
+            {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        console.log("📥 STK Query Response:", queryRes.data);
+        res.json(queryRes.data);
+
+    } catch (error) {
+        console.error("STK Query Error:", error.response?.data || error.message);
+        res.status(500).json({
+            error: "Failed to query STK status",
+            details: error.response?.data || error.message
+        });
+    }
+});
+
+/* -------------------------------
    13. Fetch Transactions (paginated)
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
