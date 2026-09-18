@@ -39,6 +39,13 @@ const transactionSchema = new mongoose.Schema({
     lastRetryAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 });
+// ← ADDED: indexes for fast lookups and pagination
+transactionSchema.index({ createdAt: -1 });
+transactionSchema.index({ phone: 1, createdAt: -1 });
+transactionSchema.index({ status: 1, createdAt: -1 });
+transactionSchema.index({ checkout_id: 1 });
+transactionSchema.index({ merchant_request_id: 1 });
+
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
@@ -453,11 +460,63 @@ app.post("/api/retry-payment", async (req, res) => {
 /* -------------------------------
    13. Fetch Transactions
 -------------------------------- */
+/* -------------------------------
+   13. Fetch Transactions (paginated)
+-------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
-        const transactions = await Transaction.find().sort({ createdAt: -1 });
-        res.json(transactions);
+        // Query params
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+        const status = (req.query.status || '').toUpperCase();
+        const phone = (req.query.phone || '').trim();
+        const search = (req.query.search || '').trim();
+
+        // Build filter
+        const filter = {};
+        if (status && ['PENDING', 'SUCCESS', 'FAILED', 'CANCELLED'].includes(status)) {
+            filter.status = status;
+        }
+        if (phone) {
+            filter.phone = phone.replace(/\s+/g, '');
+        }
+        if (search) {
+            // Case-insensitive search across name/phone/receipt
+            filter.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { phone: { $regex: search, $options: 'i' } },
+                { mpesa_receipt: { $regex: search, $options: 'i' } },
+                { checkout_id: { $regex: search, $options: 'i' } }
+            ];
+        }
+
+        const skip = (page - 1) * limit;
+
+        // Run count + fetch in parallel
+        const [total, transactions] = await Promise.all([
+            Transaction.countDocuments(filter),
+            Transaction.find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean()
+        ]);
+
+        const totalPages = Math.ceil(total / limit);
+
+        res.json({
+            data: transactions,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages,
+                hasNext: page < totalPages,
+                hasPrev: page > 1
+            }
+        });
     } catch (error) {
+        console.error("Fetch transactions error:", error);
         res.status(500).json({ error: "Failed to fetch transactions" });
     }
 });

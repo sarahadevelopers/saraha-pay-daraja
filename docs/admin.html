@@ -15,11 +15,11 @@
             --text: #1e293b;
         }
 
-        body { 
-            font-family: 'Inter', sans-serif; 
-            background-color: var(--bg); 
-            color: var(--text); 
-            margin: 0; 
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
             display: flex;
         }
 
@@ -53,14 +53,45 @@
             align-items: center;
             margin-bottom: 30px;
             flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        /* ← ADDED: filter bar */
+        .filters {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+            align-items: center;
+        }
+
+        .filters select,
+        .filters input {
+            padding: 9px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.9rem;
+            background: white;
+            color: var(--text);
+            outline: none;
+        }
+
+        .filters select:focus,
+        .filters input:focus {
+            border-color: var(--primary);
+        }
+
+        .filters input[type="text"] {
+            min-width: 220px;
         }
 
         table { width: 100%; border-collapse: collapse; }
-        
-        th { 
-            text-align: left; 
-            padding: 15px; 
-            border-bottom: 2px solid #f1f5f9; 
+
+        th {
+            text-align: left;
+            padding: 15px;
+            border-bottom: 2px solid #f1f5f9;
             color: #64748b;
             font-size: 0.85rem;
             text-transform: uppercase;
@@ -79,6 +110,7 @@
         .status-success { background: #d1fae5; color: #065f46; }
         .status-pending { background: #fef3c7; color: #92400e; }
         .status-failed { background: #fee2e2; color: #991b1b; }
+        .status-cancelled { background: #e2e8f0; color: #475569; }
 
         button {
             background: var(--primary);
@@ -91,8 +123,40 @@
             transition: 0.2s;
         }
 
-        button:hover { opacity: 0.9; }
+        button:hover:not(:disabled) { opacity: 0.9; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* ← ADDED: pagination controls */
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #f1f5f9;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .pagination-info {
+            color: #64748b;
+            font-size: 0.9rem;
+        }
+
+        .pagination-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .pagination button {
+            padding: 8px 14px;
+            font-size: 0.85rem;
+        }
+
+        .pagination button.secondary {
+            background: #e2e8f0;
+            color: #334155;
+        }
 
         .empty-message {
             text-align: center;
@@ -112,6 +176,13 @@
             font-size: 0.85rem;
             color: #64748b;
         }
+
+        /* ← ADDED: responsive tweak for small screens */
+        @media (max-width: 768px) {
+            nav { display: none; }
+            main { margin-left: 0; width: 100%; padding: 20px; }
+            .filters input[type="text"] { min-width: 140px; flex: 1; }
+        }
     </style>
 </head>
 <body>
@@ -129,11 +200,38 @@
             <button onclick="loadTransactions()" id="refreshBtn">🔄 Refresh Feed</button>
         </header>
 
+        <!-- ← ADDED: filter bar -->
+        <div class="filters">
+            <select id="statusFilter" onchange="applyFilters()">
+                <option value="">All statuses</option>
+                <option value="SUCCESS">Success</option>
+                <option value="PENDING">Pending</option>
+                <option value="FAILED">Failed</option>
+                <option value="CANCELLED">Cancelled</option>
+            </select>
+
+            <input
+                type="text"
+                id="searchInput"
+                placeholder="Search name, phone, receipt…"
+                onkeydown="if(event.key==='Enter'){applyFilters();}"
+            />
+
+            <select id="limitSelect" onchange="applyFilters()">
+                <option value="10">10 / page</option>
+                <option value="20" selected>20 / page</option>
+                <option value="50">50 / page</option>
+                <option value="100">100 / page</option>
+            </select>
+
+            <button class="secondary" onclick="clearFilters()" style="background:#e2e8f0;color:#334155;">Clear</button>
+        </div>
+
         <div class="card">
             <table>
                 <thead>
                     <tr>
-                        <th>Date & Time</th>
+                        <th>Date &amp; Time</th>
                         <th>Subscriber</th>
                         <th>Amount</th>
                         <th>Status</th>
@@ -144,43 +242,94 @@
                     <tr><td colspan="5" class="empty-message">Loading transactions...</td></tr>
                 </tbody>
             </table>
+
+            <!-- ← ADDED: pagination footer -->
+            <div class="pagination" id="paginationBar" style="display:none;">
+                <div class="pagination-info" id="paginationInfo"></div>
+                <div class="pagination-buttons">
+                    <button class="secondary" id="prevBtn" onclick="gotoPage(currentPage - 1)">← Prev</button>
+                    <button class="secondary" id="nextBtn" onclick="gotoPage(currentPage + 1)">Next →</button>
+                </div>
+            </div>
         </div>
     </main>
 
     <script>
+        // ← ADDED: pagination state
+        let currentPage = 1;
+        let currentLimit = 20;
+
+        function buildQuery() {
+            const params = new URLSearchParams();
+            params.set('page', currentPage);
+            params.set('limit', currentLimit);
+
+            const status = document.getElementById('statusFilter').value;
+            if (status) params.set('status', status);
+
+            const search = document.getElementById('searchInput').value.trim();
+            if (search) params.set('search', search);
+
+            return params.toString();
+        }
+
+        function applyFilters() {
+            currentPage = 1;
+            currentLimit = parseInt(document.getElementById('limitSelect').value) || 20;
+            loadTransactions();
+        }
+
+        function clearFilters() {
+            document.getElementById('statusFilter').value = '';
+            document.getElementById('searchInput').value = '';
+            document.getElementById('limitSelect').value = '20';
+            currentPage = 1;
+            currentLimit = 20;
+            loadTransactions();
+        }
+
+        function gotoPage(page) {
+            if (page < 1) return;
+            currentPage = page;
+            loadTransactions();
+        }
+
         async function loadTransactions() {
             const btn = document.getElementById('refreshBtn');
             const body = document.getElementById('transactionBody');
-            
-            // Disable button and show loading
+            const paginationBar = document.getElementById('paginationBar');
+
             btn.disabled = true;
             btn.innerText = '🔄 Loading...';
             body.innerHTML = '<tr><td colspan="5" class="empty-message">Fetching data...</td></tr>';
 
             try {
-                const response = await fetch('/api/transactions');
-                
+                const query = buildQuery();
+                const response = await fetch(`/api/transactions?${query}`);
+
                 if (!response.ok) {
                     throw new Error(`HTTP error ${response.status}`);
                 }
-                
-                const data = await response.json();
-                
-                // Clear table
+
+                const payload = await response.json();
+
+                // ← CHANGED: new response shape { data, pagination }
+                const transactions = Array.isArray(payload) ? payload : (payload.data || []);
+                const pagination = payload.pagination || null;
+
                 body.innerHTML = '';
 
-                if (!data || data.length === 0) {
+                if (!transactions.length) {
                     body.innerHTML = '<tr><td colspan="5" class="empty-message">No transactions found</td></tr>';
+                    paginationBar.style.display = 'none';
                     return;
                 }
 
                 // Populate rows
-                data.forEach(tx => {
-                    // Determine status class
+                transactions.forEach(tx => {
                     const status = tx.status || 'PENDING';
                     const statusClass = `status-${status.toLowerCase()}`;
-                    
-                    // Format date
+
                     const date = new Date(tx.createdAt);
                     const formattedDate = date.toLocaleString('en-KE', {
                         day: '2-digit',
@@ -192,37 +341,66 @@
                         hour12: true
                     });
 
-                    // Build row
                     const row = `
                         <tr>
                             <td style="color: #64748b;">${formattedDate}</td>
                             <td>
                                 <div class="subscriber-info">
-                                    <span class="subscriber-name">${tx.name || '—'}</span>
-                                    <span class="subscriber-phone">${tx.phone || '—'}</span>
+                                    <span class="subscriber-name">${escapeHtml(tx.name || '—')}</span>
+                                    <span class="subscriber-phone">${escapeHtml(tx.phone || '—')}</span>
                                 </div>
                             </td>
-                            <td><strong>KES ${tx.amount}</strong></td>
+                            <td><strong>KES ${escapeHtml(tx.amount || '—')}</strong></td>
                             <td><span class="badge ${statusClass}">${status}</span></td>
-                            <td><code>${tx.mpesa_receipt || '—'}</code></td>
+                            <td><code>${escapeHtml(tx.mpesa_receipt || '—')}</code></td>
                         </tr>
                     `;
                     body.innerHTML += row;
                 });
 
+                // ← ADDED: update pagination controls
+                if (pagination) {
+                    paginationBar.style.display = 'flex';
+
+                    const start = (pagination.page - 1) * pagination.limit + 1;
+                    const end = Math.min(pagination.page * pagination.limit, pagination.total);
+
+                    document.getElementById('paginationInfo').innerText =
+                        `Showing ${start}–${end} of ${pagination.total.toLocaleString()} ` +
+                        `(page ${pagination.page} of ${pagination.totalPages || 1})`;
+
+                    document.getElementById('prevBtn').disabled = !pagination.hasPrev;
+                    document.getElementById('nextBtn').disabled = !pagination.hasNext;
+                } else {
+                    paginationBar.style.display = 'none';
+                }
+
             } catch (err) {
                 console.error('Failed to load transactions:', err);
-                body.innerHTML = `<tr><td colspan="5" class="empty-message">❌ Error loading data: ${err.message}</td></tr>`;
+                body.innerHTML = `<tr><td colspan="5" class="empty-message">❌ Error loading data: ${escapeHtml(err.message)}</td></tr>`;
+                paginationBar.style.display = 'none';
             } finally {
-                // Re-enable button
                 btn.disabled = false;
                 btn.innerText = '🔄 Refresh Feed';
             }
         }
 
-        // Load immediately and set interval
+        // ← ADDED: simple HTML escape to prevent XSS in table cells
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Load immediately
         loadTransactions();
-        setInterval(loadTransactions, 30000); // auto-refresh every 30 seconds
+
+        // Auto-refresh every 30 seconds
+        setInterval(loadTransactions, 30000);
     </script>
 </body>
 </html>
