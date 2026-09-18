@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quick Pay | Eclipse Ent</title>
+
+<style>
+body{
+font-family:'Inter',sans-serif;
+display:flex;
+justify-content:center;
+align-items:center;
+height:100vh;
+background:#f1f5f9;
+margin:0;
+}
+
+.checkout-card{
+background:white;
+padding:40px;
+border-radius:16px;
+box-shadow:0 10px 25px rgba(0,0,0,0.05);
+width:100%;
+max-width:400px;
+text-align:center;
+}
+
+input{
+width:100%;
+padding:12px;
+margin:10px 0;
+border:1px solid #e2e8f0;
+border-radius:8px;
+box-sizing:border-box;
+font-size:1rem;
+}
+
+button{
+width:100%;
+background:#000;
+color:white;
+padding:14px;
+border:none;
+border-radius:8px;
+font-size:1rem;
+font-weight:600;
+cursor:pointer;
+margin-top:10px;
+}
+
+button:disabled{
+background:#555;
+cursor:not-allowed;
+}
+
+#status{
+margin-top:20px;
+font-size:0.9rem;
+}
+</style>
+
+<!-- ========== reCAPTCHA v3 (invisible) ========== -->
+<!-- Your actual site key – no duplicate script tags -->
+<script src="https://www.google.com/recaptcha/api.js?render=6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5"></script>
+
+</head>
+<body>
+
+<div class="checkout-card">
+
+<h2 style="margin-top:0;">Secure Payment</h2>
+<p style="color:#64748b;">Enter details to pay via M-Pesa</p>
+
+<input 
+type="text"
+id="name"
+placeholder="Full Name"
+required
+>
+
+<input 
+type="tel"
+id="phone"
+placeholder="Phone (e.g. 0712345678, 0111234567, or 254111234567)"
+pattern="^(07[0-9]{8}|011[0-9]{7}|2547[0-9]{8}|25411[0-9]{7})$"
+title="Enter a valid Safaricom number: 07XXXXXXXX (10 digits), 011XXXXXXX (10 digits), 2547XXXXXXXX (12 digits), or 25411XXXXXXX (12 digits)"
+required
+>
+
+<input 
+type="number"
+id="amount"
+placeholder="Amount in KES"
+min="1"
+required
+>
+
+<button id="payBtn" onclick="handlePayment()">
+Pay Now
+</button>
+
+<div id="status"></div>
+
+</div>
+
+<!-- Your main script (must be updated to send the reCAPTCHA token) -->
+<script src="script.js"></script>
+
+</body>
+</html>

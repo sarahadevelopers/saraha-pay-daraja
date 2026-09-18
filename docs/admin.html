@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Eclipse Ent | Payment Admin</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #2563eb;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --bg: #f8fafc;
+            --text: #1e293b;
+        }
+
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: var(--bg); 
+            color: var(--text); 
+            margin: 0; 
+            display: flex;
+        }
+
+        nav {
+            width: 240px;
+            height: 100vh;
+            background: #1e293b;
+            color: white;
+            padding: 20px;
+            position: fixed;
+            box-sizing: border-box;
+        }
+
+        main {
+            margin-left: 280px;
+            padding: 40px;
+            width: calc(100% - 280px);
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+            padding: 20px;
+            overflow-x: auto;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+
+        table { width: 100%; border-collapse: collapse; }
+        
+        th { 
+            text-align: left; 
+            padding: 15px; 
+            border-bottom: 2px solid #f1f5f9; 
+            color: #64748b;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+        }
+
+        td { padding: 15px; border-bottom: 1px solid #f1f5f9; font-size: 0.95rem; }
+
+        .badge {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: capitalize;
+        }
+
+        .status-success { background: #d1fae5; color: #065f46; }
+        .status-pending { background: #fef3c7; color: #92400e; }
+        .status-failed { background: #fee2e2; color: #991b1b; }
+
+        button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: 0.2s;
+        }
+
+        button:hover { opacity: 0.9; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .empty-message {
+            text-align: center;
+            padding: 40px;
+            color: #94a3b8;
+            font-style: italic;
+        }
+
+        .subscriber-info {
+            display: flex;
+            flex-direction: column;
+        }
+        .subscriber-name {
+            font-weight: 600;
+        }
+        .subscriber-phone {
+            font-size: 0.85rem;
+            color: #64748b;
+        }
+    </style>
+</head>
+<body>
+
+    <nav>
+        <h2>Eclipse Ent</h2>
+        <p style="opacity: 0.6; font-size: 0.8rem;">Kopo Kopo Manager</p>
+        <hr style="opacity: 0.1; margin: 20px 0;">
+        <div style="font-weight: 600;">📊 Dashboard</div>
+    </nav>
+
+    <main>
+        <header>
+            <h1>Payment History</h1>
+            <button onclick="loadTransactions()" id="refreshBtn">🔄 Refresh Feed</button>
+        </header>
+
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date & Time</th>
+                        <th>Subscriber</th>
+                        <th>Amount</th>
+                        <th>Status</th>
+                        <th>Receipt #</th>
+                    </tr>
+                </thead>
+                <tbody id="transactionBody">
+                    <tr><td colspan="5" class="empty-message">Loading transactions...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </main>
+
+    <script>
+        async function loadTransactions() {
+            const btn = document.getElementById('refreshBtn');
+            const body = document.getElementById('transactionBody');
+            
+            // Disable button and show loading
+            btn.disabled = true;
+            btn.innerText = '🔄 Loading...';
+            body.innerHTML = '<tr><td colspan="5" class="empty-message">Fetching data...</td></tr>';
+
+            try {
+                const response = await fetch('/api/transactions');
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                // Clear table
+                body.innerHTML = '';
+
+                if (!data || data.length === 0) {
+                    body.innerHTML = '<tr><td colspan="5" class="empty-message">No transactions found</td></tr>';
+                    return;
+                }
+
+                // Populate rows
+                data.forEach(tx => {
+                    // Determine status class
+                    const status = tx.status || 'PENDING';
+                    const statusClass = `status-${status.toLowerCase()}`;
+                    
+                    // Format date
+                    const date = new Date(tx.createdAt);
+                    const formattedDate = date.toLocaleString('en-KE', {
+                        day: '2-digit',
+                        month: 'short',
+                        year: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: true
+                    });
+
+                    // Build row
+                    const row = `
+                        <tr>
+                            <td style="color: #64748b;">${formattedDate}</td>
+                            <td>
+                                <div class="subscriber-info">
+                                    <span class="subscriber-name">${tx.name || '—'}</span>
+                                    <span class="subscriber-phone">${tx.phone || '—'}</span>
+                                </div>
+                            </td>
+                            <td><strong>KES ${tx.amount}</strong></td>
+                            <td><span class="badge ${statusClass}">${status}</span></td>
+                            <td><code>${tx.mpesa_receipt || '—'}</code></td>
+                        </tr>
+                    `;
+                    body.innerHTML += row;
+                });
+
+            } catch (err) {
+                console.error('Failed to load transactions:', err);
+                body.innerHTML = `<tr><td colspan="5" class="empty-message">❌ Error loading data: ${err.message}</td></tr>`;
+            } finally {
+                // Re-enable button
+                btn.disabled = false;
+                btn.innerText = '🔄 Refresh Feed';
+            }
+        }
+
+        // Load immediately and set interval
+        loadTransactions();
+        setInterval(loadTransactions, 30000); // auto-refresh every 30 seconds
+    </script>
+</body>
+</html>
