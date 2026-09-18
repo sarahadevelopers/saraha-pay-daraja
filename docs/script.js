@@ -15,7 +15,8 @@ function setPayButton(disabled, text = null) {
 }
 
 // ---------- API Base URLs (Daraja) ----------
-const API_BASE = "https://sarahapay-daraja.onrender.com";
+// ← CHANGED: fixed hostname (sarahapay → saraha-pay). Must match Render's URL exactly.
+const API_BASE = "https://saraha-pay-daraja.onrender.com";
 const API_PAY_URL = `${API_BASE}/api/pay`;
 const API_RETRY_URL = `${API_BASE}/api/retry-payment`;
 
