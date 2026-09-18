@@ -273,40 +273,87 @@ console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);   // �
 /* -------------------------------
    10. Helper: Initiate STK Push (via SDK)
 -------------------------------- */
+/* -------------------------------
+   10. Helper: Initiate STK Push (Direct API)
+-------------------------------- */
 async function initiateStkPush(name, phone, amount, retryCount = 0) {
-    // Normalize phone to 254XXXXXXXXX
+    // 1. Normalize phone to 254XXXXXXXXX
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
         .replace(/^0/, '254');
-
     if (!formattedPhone.startsWith('254')) {
         formattedPhone = '254' + formattedPhone;
     }
 
-    const accountRef = `PAY-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    // 2. Get OAuth Access Token
+    const auth = Buffer.from(
+        `${process.env.DARAJA_CONSUMER_KEY}:${process.env.DARAJA_CONSUMER_SECRET}`
+    ).toString('base64');
 
-    console.log("📤 Daraja STK Request (SDK):", {
+    let accessToken;
+    try {
+        const tokenRes = await axios.get(
+            `${DARAJA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
+            { headers: { Authorization: `Basic ${auth}` } }
+        );
+        accessToken = tokenRes.data.access_token;
+    } catch (err) {
+        console.error('❌ Failed to get Daraja access token:', err.response?.data || err.message);
+        throw new Error('Could not authenticate with Safaricom. Check your Consumer Key and Secret.');
+    }
+
+    // 3. Generate Timestamp and Password
+    const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+    const password = Buffer.from(
+        `${process.env.DARAJA_SHORTCODE}${process.env.DARAJA_PASSKEY}${timestamp}`
+    ).toString('base64');
+
+    // 4. Build the STK Push Request
+    const accountRef = `PAY-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    
+    console.log("📤 Daraja STK Request (Direct API):", {
         phone: formattedPhone,
         amount: Math.round(parseFloat(amount)),
         accountRef,
         callbackUrl: process.env.DARAJA_CALLBACK_URL
     });
 
-    const response = await daraja.stkPush({
-        phoneNumber: formattedPhone,
-        amount: Math.round(parseFloat(amount)),
-        accountReference: accountRef,
-        // ← CHANGED: use the name directly (no "Payment from " prefix) so it isn't truncated to "Payment from "
-        transactionDesc: (name || 'Sarahapay').substring(0, 13),
-        callbackUrl: process.env.DARAJA_CALLBACK_URL
-        // NOTE: if the SDK uses Safaricom's raw field name, change to:
-        // callBackURL: process.env.DARAJA_CALLBACK_URL
-    });
+    const stkPayload = {
+        BusinessShortCode: process.env.DARAJA_SHORTCODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: "CustomerPayBillOnline",
+        Amount: Math.round(parseFloat(amount)),
+        PartyA: formattedPhone,
+        PartyB: process.env.DARAJA_SHORTCODE,
+        PhoneNumber: formattedPhone,
+        CallBackURL: process.env.DARAJA_CALLBACK_URL, // Note: capital B and URL
+        AccountReference: accountRef,
+        TransactionDesc: (name || 'Sarahapay').substring(0, 13)
+    };
 
-    console.log("📥 Daraja Response (SDK):", response);
+    let response;
+    try {
+        const stkRes = await axios.post(
+            `${DARAJA_BASE_URL}/mpesa/stkpush/v1/processrequest`,
+            stkPayload,
+            {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        response = stkRes.data;
+        console.log("📥 Daraja Response (Direct API):", response);
+    } catch (err) {
+        console.error('❌ Daraja STK Push failed:', err.response?.data || err.message);
+        const errorMsg = err.response?.data?.errorMessage || err.response?.data?.ResponseDescription || 'Daraja STK push failed';
+        throw new Error(errorMsg);
+    }
 
-    // The SDK returns the Daraja response object
+    // 5. Check for Success and Save Transaction
     if (response.ResponseCode !== '0') {
         const errorMsg = response.ResponseDescription || 'Daraja STK push failed';
         throw new Error(errorMsg);
