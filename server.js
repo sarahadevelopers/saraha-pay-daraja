@@ -12,6 +12,9 @@ const { SafaricomDarajaApi } = require('mds-daraja-sdk');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// ← ADDED: trust Render's reverse proxy so req.ip returns the real client IP
+app.set('trust proxy', 1);
+
 /* -------------------------------
    1. MongoDB Connection
 -------------------------------- */
@@ -53,7 +56,8 @@ const allowedOrigins = [
     'http://localhost:3000',
     'https://fine-2zxp.onrender.com',
     'https://rentspace.co.ke',
-    'https://www.rentspace.co.ke'
+    'https://www.rentspace.co.ke',
+    'https://saraha-pay-daraja.onrender.com'   // ← ADDED: allow the Render host itself
 ];
 
 app.use(cors({
@@ -257,6 +261,7 @@ const daraja = new SafaricomDarajaApi({
 console.log(`📍 Daraja Environment: ${DARAJA_ENV}`);
 console.log(`📍 Daraja Base URL: ${DARAJA_BASE_URL}`);
 console.log(`📍 Daraja Shortcode: ${process.env.DARAJA_SHORTCODE}`);
+console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);   // ← ADDED: log callback for easy verification
 
 /* -------------------------------
    10. Helper: Initiate STK Push (via SDK)
@@ -277,15 +282,19 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
     console.log("📤 Daraja STK Request (SDK):", {
         phone: formattedPhone,
         amount: Math.round(parseFloat(amount)),
-        accountRef
+        accountRef,
+        callbackUrl: process.env.DARAJA_CALLBACK_URL
     });
 
     const response = await daraja.stkPush({
         phoneNumber: formattedPhone,
         amount: Math.round(parseFloat(amount)),
         accountReference: accountRef,
-        transactionDesc: `Payment from ${name || 'Sarahapay'}`.substring(0, 13),
+        // ← CHANGED: use the name directly (no "Payment from " prefix) so it isn't truncated to "Payment from "
+        transactionDesc: (name || 'Sarahapay').substring(0, 13),
         callbackUrl: process.env.DARAJA_CALLBACK_URL
+        // NOTE: if the SDK uses Safaricom's raw field name, change to:
+        // callBackURL: process.env.DARAJA_CALLBACK_URL
     });
 
     console.log("📥 Daraja Response (SDK):", response);
@@ -469,7 +478,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   15. Daraja Payment Callback (Webhook) — UNCHANGED
+   15. Daraja Payment Callback (Webhook)
 -------------------------------- */
 app.post("/callback", async (req, res) => {
     console.log("========================================");
@@ -556,10 +565,14 @@ app.post("/callback", async (req, res) => {
                     reference: checkoutId
                 };
 
-                // Forward to FineEscorts
+                // ── Forward to FineEscorts ─────────────────────
+                // ← CHANGED: now reads from env with a sensible fallback
+                const fineEscortsUrl = process.env.FINEESCORTS_WEBHOOK_URL
+                    || 'https://fineescorts.co.ke/payment-callback';
+
                 try {
                     await axios.post(
-                        'https://fineescorts.co.ke/payment-callback',
+                        fineEscortsUrl,
                         {
                             transactionId: transaction._id,
                             checkoutId: transaction.checkout_id,
@@ -571,13 +584,15 @@ app.post("/callback", async (req, res) => {
                         },
                         { timeout: 5000 }
                     );
-                    console.log('✅ Forwarded callback to FineEscorts');
+                    console.log(`✅ Forwarded callback to FineEscorts (${fineEscortsUrl})`);
                 } catch (err) {
                     console.error('❌ Failed to forward callback to FineEscorts:', err.message);
                 }
 
-                // Forward to RentSpace (supports comma-separated URLs)
-                const webhookUrls = (process.env.RENTSPACE_WEBHOOK_URL || 'https://rentspace-markeplace.onrender.com/api/subscriptions/saraha-webhook')
+                // ── Forward to RentSpace (supports comma-separated URLs) ──
+                // ← CHANGED: fixed "markeplace" → "marketplace" typo in fallback URL
+                const webhookUrls = (process.env.RENTSPACE_WEBHOOK_URL
+                    || 'https://rentspace-marketplace.onrender.com/api/subscriptions/saraha-webhook')
                     .split(',')
                     .map(u => u.trim())
                     .filter(Boolean);
