@@ -257,7 +257,9 @@ const DARAJA_BASE_URL = DARAJA_ENV === 'sandbox'
 console.log(`📍 Daraja Environment: ${DARAJA_ENV}`);
 console.log(`📍 Daraja Base URL: ${DARAJA_BASE_URL}`);
 console.log(`📍 Daraja Shortcode: ${process.env.DARAJA_SHORTCODE}`);
+console.log(`📍 Daraja Till: ${process.env.DARAJA_TILL_NUMBER}`);
 console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);
+console.log(`📍 Forward Webhooks: ${process.env.FORWARD_WEBHOOK_URLS || '(none configured)'}`);
 
 /* -------------------------------
    10. Helper: Initiate STK Push (Direct API)
@@ -305,19 +307,19 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         callbackUrl: process.env.DARAJA_CALLBACK_URL
     });
 
- const stkPayload = {
-    BusinessShortCode: process.env.DARAJA_SHORTCODE,      // 1148428
-    Password: password,                                    // unchanged
-    Timestamp: timestamp,
-    TransactionType: "CustomerBuyGoodsOnline",
-    Amount: Math.round(parseFloat(amount)),
-    PartyA: formattedPhone,
-    PartyB: process.env.DARAJA_TILL_NUMBER,               // ← 1621614
-    PhoneNumber: formattedPhone,
-    CallBackURL: process.env.DARAJA_CALLBACK_URL,
-    AccountReference: accountRef,
-    TransactionDesc: (name || 'Sarahapay').substring(0, 13)
-};
+    const stkPayload = {
+        BusinessShortCode: process.env.DARAJA_SHORTCODE,      // Store/HO number
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: "CustomerBuyGoodsOnline",
+        Amount: Math.round(parseFloat(amount)),
+        PartyA: formattedPhone,
+        PartyB: process.env.DARAJA_TILL_NUMBER,               // Till number
+        PhoneNumber: formattedPhone,
+        CallBackURL: process.env.DARAJA_CALLBACK_URL,
+        AccountReference: accountRef,
+        TransactionDesc: (name || 'Sarahapay').substring(0, 13)
+    };
 
     let response;
     try {
@@ -692,50 +694,54 @@ app.post("/callback", async (req, res) => {
             await transaction.save();
             console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
 
+            // ── Forward on success ──────────────────────────────────
             if (status === 'SUCCESS') {
+                // Unified payload — includes both snake_case and camelCase keys
+                // so downstream sites can read whichever they expect
                 const callbackPayload = {
+                    transactionId: transaction._id,
+                    checkoutId: transaction.checkout_id,
                     checkout_id: transaction.checkout_id,
-                    status: 'paid',
+                    merchantRequestId: transaction.merchant_request_id,
+                    status: 'SUCCESS',
+                    paid: true,
                     mpesa_receipt: receipt || transaction.mpesa_receipt,
+                    receipt: receipt || transaction.mpesa_receipt,
                     amount: transaction.amount,
                     phone: transaction.phone,
                     name: transaction.name,
-                    reference: checkoutId
+                    reference: checkoutId,
+                    createdAt: transaction.createdAt
                 };
 
-                // Forward to FineEscorts
-                const fineEscortsUrl = process.env.FINEESCORTS_WEBHOOK_URL
-                    || 'https://fineescorts.co.ke/payment-callback';
+                // Collect forwarding targets from env (comma-separated, deduped)
+                const rawUrls = [
+                    process.env.FORWARD_WEBHOOK_URLS,      // primary (recommended)
+                    process.env.RENTSPACE_WEBHOOK_URL,     // backward compat
+                    process.env.FINEESCORTS_WEBHOOK_URL    // backward compat
+                ]
+                    .filter(Boolean)
+                    .join(',');
 
-                try {
-                    await axios.post(
-                        fineEscortsUrl,
-                        {
-                            transactionId: transaction._id,
-                            checkoutId: transaction.checkout_id,
-                            status: status,
-                            receipt: receipt,
-                            phone: transaction.phone,
-                            amount: transaction.amount,
-                            name: transaction.name
-                        },
-                        { timeout: 5000 }
-                    );
-                    console.log(`✅ Forwarded callback to FineEscorts (${fineEscortsUrl})`);
-                } catch (err) {
-                    console.error('❌ Failed to forward callback to FineEscorts:', err.message);
+                const webhookUrls = [...new Set(
+                    rawUrls.split(',').map(u => u.trim()).filter(Boolean)
+                )];
+
+                if (!webhookUrls.length) {
+                    console.log('ℹ️  No forwarding webhooks configured — skipping forward');
                 }
 
-                // Forward to RentSpace (supports comma-separated URLs)
-                const webhookUrls = (process.env.RENTSPACE_WEBHOOK_URL
-                    || 'https://rentspace-marketplace.onrender.com/api/subscriptions/saraha-webhook')
-                    .split(',')
-                    .map(u => u.trim())
-                    .filter(Boolean);
+                // Optional shared secret header for downstream auth
+                const forwardHeaders = process.env.FORWARD_WEBHOOK_SECRET
+                    ? { 'x-api-secret': process.env.FORWARD_WEBHOOK_SECRET }
+                    : {};
 
                 for (const webhookUrl of webhookUrls) {
                     try {
-                        await axios.post(webhookUrl, callbackPayload, { timeout: 5000 });
+                        await axios.post(webhookUrl, callbackPayload, {
+                            timeout: 5000,
+                            headers: forwardHeaders
+                        });
                         console.log(`✅ Forwarded callback to ${webhookUrl}`);
                     } catch (err) {
                         console.error(`❌ Failed to forward callback to ${webhookUrl}:`, err.message);
