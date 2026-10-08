@@ -305,14 +305,14 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         callbackUrl: process.env.DARAJA_CALLBACK_URL
     });
 
-   const stkPayload = {
-    BusinessShortCode: process.env.DARAJA_SHORTCODE,
-    Password: password,
+ const stkPayload = {
+    BusinessShortCode: process.env.DARAJA_SHORTCODE,      // 1148428
+    Password: password,                                    // unchanged
     Timestamp: timestamp,
-    TransactionType: "CustomerBuyGoodsOnline",  // ← Buy Goods (Till)
+    TransactionType: "CustomerBuyGoodsOnline",
     Amount: Math.round(parseFloat(amount)),
     PartyA: formattedPhone,
-    PartyB: process.env.DARAJA_SHORTCODE,
+    PartyB: process.env.DARAJA_TILL_NUMBER,               // ← 1621614
     PhoneNumber: formattedPhone,
     CallBackURL: process.env.DARAJA_CALLBACK_URL,
     AccountReference: accountRef,
