@@ -305,19 +305,19 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         callbackUrl: process.env.DARAJA_CALLBACK_URL
     });
 
-    const stkPayload = {
-        BusinessShortCode: process.env.DARAJA_SHORTCODE,
-        Password: password,
-        Timestamp: timestamp,
-        TransactionType: "CustomerPayBillOnline",
-        Amount: Math.round(parseFloat(amount)),
-        PartyA: formattedPhone,
-        PartyB: process.env.DARAJA_SHORTCODE,
-        PhoneNumber: formattedPhone,
-        CallBackURL: process.env.DARAJA_CALLBACK_URL,
-        AccountReference: accountRef,
-        TransactionDesc: (name || 'Sarahapay').substring(0, 13)
-    };
+   const stkPayload = {
+    BusinessShortCode: process.env.DARAJA_SHORTCODE,
+    Password: password,
+    Timestamp: timestamp,
+    TransactionType: "CustomerBuyGoodsOnline",  // ← Buy Goods (Till)
+    Amount: Math.round(parseFloat(amount)),
+    PartyA: formattedPhone,
+    PartyB: process.env.DARAJA_SHORTCODE,
+    PhoneNumber: formattedPhone,
+    CallBackURL: process.env.DARAJA_CALLBACK_URL,
+    AccountReference: accountRef,
+    TransactionDesc: (name || 'Sarahapay').substring(0, 13)
+};
 
     let response;
     try {
