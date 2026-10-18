@@ -9,7 +9,6 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Trust Render's reverse proxy so req.ip returns the real client IP
 app.set('trust proxy', 1);
 
 /* -------------------------------
@@ -26,9 +25,11 @@ const transactionSchema = new mongoose.Schema({
     name: String,
     phone: String,
     amount: String,
+    bundle_sku: String,             // ← optional: which bundle (for site routing)
+    source: String,                 // ← optional: 'bingwasoko' | 'datasokoni'
     status: { type: String, default: "PENDING" },
-    checkout_id: String,          // Daraja CheckoutRequestID
-    merchant_request_id: String,  // Daraja MerchantRequestID
+    checkout_id: String,
+    merchant_request_id: String,
     mpesa_receipt: String,
     result_code: Number,
     result_desc: String,
@@ -37,7 +38,6 @@ const transactionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
-// Indexes for fast lookups and pagination
 transactionSchema.index({ createdAt: -1 });
 transactionSchema.index({ phone: 1, createdAt: -1 });
 transactionSchema.index({ status: 1, createdAt: -1 });
@@ -67,11 +67,8 @@ const allowedOrigins = [
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
+        if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+        callback(new Error('Not allowed by CORS'));
     },
     credentials: true
 }));
@@ -79,6 +76,35 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static("docs"));
+
+/* -------------------------------
+   3b. Basic Auth for Admin (← ADDED)
+-------------------------------- */
+// Protects /admin.html, /api/transactions, /api/transaction/:id
+// Uses HTTP Basic — browsers prompt for username/password
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS;  // must be set in Render env
+
+const adminAuth = (req, res, next) => {
+    if (!ADMIN_PASS) {
+        console.warn('⚠️  ADMIN_PASS not set — admin routes are UNPROTECTED');
+        return next();
+    }
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Basic ')) {
+        res.set('WWW-Authenticate', 'Basic realm="Sarahapay Admin"');
+        return res.status(401).send('Authentication required');
+    }
+    const [user, pass] = Buffer.from(auth.slice(6), 'base64').toString().split(':');
+    if (user === ADMIN_USER && pass === ADMIN_PASS) return next();
+    res.set('WWW-Authenticate', 'Basic realm="Sarahapay Admin"');
+    return res.status(401).send('Invalid credentials');
+};
+
+// Protect admin page + read endpoints
+app.use('/admin.html', adminAuth);
+app.use('/api/transactions', adminAuth);
+app.use('/api/transaction', adminAuth);
 
 /* -------------------------------
    4. Shared Secret Check
@@ -121,11 +147,15 @@ const checkSecret = (req, res, next) => {
 
 /* -------------------------------
    5. reCAPTCHA Verification
+   (graceful: only rejects if token present AND score low)
 -------------------------------- */
 const verifyRecaptcha = async (req, res, next) => {
     const token = req.headers['x-recaptcha-token'] || req.body.recaptchaToken;
+
+    // ← CHANGED: if token missing, don't block — let rate limiter handle it
     if (!token) {
-        return res.status(400).json({ error: "Missing reCAPTCHA token" });
+        console.warn('⚠️  Missing reCAPTCHA token — falling back to rate limits');
+        return next();
     }
 
     try {
@@ -142,15 +172,16 @@ const verifyRecaptcha = async (req, res, next) => {
         );
 
         const { success, score } = verification.data;
-        if (!success || score < 0.5) {
+        if (!success || (typeof score === 'number' && score < 0.5)) {
             console.log(`reCAPTCHA failed: success=${success}, score=${score}`);
             return res.status(403).json({ error: "Bot detected. Please try again." });
         }
 
         next();
     } catch (error) {
-        console.error("reCAPTCHA verification error:", error);
-        return res.status(500).json({ error: "CAPTCHA verification failed" });
+        // ← CHANGED: don't block legitimate payments on verification errors
+        console.error("reCAPTCHA verification error (allowing through):", error.message);
+        next();
     }
 };
 
@@ -177,8 +208,8 @@ const globalRateLimit = (req, res, next) => {
 
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
-// app.use('/api/pay', verifyRecaptcha); // Uncomment for production
-// app.use('/api/retry-payment', verifyRecaptcha);
+app.use('/api/pay', verifyRecaptcha);            // ← ENABLED (graceful)
+app.use('/api/retry-payment', verifyRecaptcha);
 app.use('/api/pay', globalRateLimit);
 app.use('/api/retry-payment', globalRateLimit);
 
@@ -247,6 +278,28 @@ app.get("/", (req, res) => {
 });
 
 /* -------------------------------
+   8b. Callback IP Whitelist (← ADDED)
+   Set SAFARICOM_CALLBACK_IPS in env to enforce.
+   Format: comma-separated prefixes, e.g. "196.201.214.,196.201.213."
+   If unset, only warns (so you can observe real IPs before enforcing).
+-------------------------------- */
+const SAFARICOM_IPS = (process.env.SAFARICOM_CALLBACK_IPS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+const callbackIpCheck = (req, res, next) => {
+    const ip = req.ip || '';
+    if (SAFARICOM_IPS.length === 0) {
+        console.warn(`⚠️  Callback from ${ip} (IP whitelist disabled — set SAFARICOM_CALLBACK_IPS to enforce)`);
+        return next();
+    }
+    if (SAFARICOM_IPS.some(prefix => ip.startsWith(prefix))) {
+        return next();
+    }
+    console.warn(`🚫 Blocked callback from non-Safaricom IP: ${ip}`);
+    return res.status(403).send('Forbidden');
+};
+
+/* -------------------------------
    9. Daraja Configuration
 -------------------------------- */
 const DARAJA_ENV = process.env.DARAJA_ENVIRONMENT || 'production';
@@ -260,12 +313,13 @@ console.log(`📍 Daraja Shortcode: ${process.env.DARAJA_SHORTCODE}`);
 console.log(`📍 Daraja Till: ${process.env.DARAJA_TILL_NUMBER}`);
 console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);
 console.log(`📍 Forward Webhooks: ${process.env.FORWARD_WEBHOOK_URLS || '(none configured)'}`);
+console.log(`📍 Admin Auth: ${ADMIN_PASS ? 'ENABLED' : 'DISABLED (set ADMIN_PASS!)'}`);
+console.log(`📍 Callback IP Whitelist: ${SAFARICOM_IPS.length ? SAFARICOM_IPS.join(',') : 'DISABLED (set SAFARICOM_CALLBACK_IPS)'}`);
 
 /* -------------------------------
    10. Helper: Initiate STK Push (Direct API)
 -------------------------------- */
-async function initiateStkPush(name, phone, amount, retryCount = 0) {
-    // 1. Normalize phone to 254XXXXXXXXX
+async function initiateStkPush(name, phone, amount, retryCount = 0, bundleSku = null, source = null) {
     let formattedPhone = phone
         .replace(/\s+/g, '')
         .replace(/^\+/, '')
@@ -274,7 +328,6 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         formattedPhone = '254' + formattedPhone;
     }
 
-    // 2. Get OAuth Access Token
     const auth = Buffer.from(
         `${process.env.DARAJA_CONSUMER_KEY}:${process.env.DARAJA_CONSUMER_SECRET}`
     ).toString('base64');
@@ -291,30 +344,30 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         throw new Error('Could not authenticate with Safaricom. Check your Consumer Key and Secret.');
     }
 
-    // 3. Generate Timestamp and Password
     const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
     const password = Buffer.from(
         `${process.env.DARAJA_SHORTCODE}${process.env.DARAJA_PASSKEY}${timestamp}`
     ).toString('base64');
 
-    // 4. Build the STK Push Request
     const accountRef = `PAY-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
-    console.log("📤 Daraja STK Request (Direct API):", {
+    console.log("📤 Daraja STK Request:", {
         phone: formattedPhone,
         amount: Math.round(parseFloat(amount)),
         accountRef,
-        callbackUrl: process.env.DARAJA_CALLBACK_URL
+        callbackUrl: process.env.DARAJA_CALLBACK_URL,
+        bundleSku,
+        source
     });
 
     const stkPayload = {
-        BusinessShortCode: process.env.DARAJA_SHORTCODE,      // Store/HO number
+        BusinessShortCode: process.env.DARAJA_SHORTCODE,
         Password: password,
         Timestamp: timestamp,
         TransactionType: "CustomerBuyGoodsOnline",
         Amount: Math.round(parseFloat(amount)),
         PartyA: formattedPhone,
-        PartyB: process.env.DARAJA_TILL_NUMBER,               // Till number
+        PartyB: process.env.DARAJA_TILL_NUMBER,
         PhoneNumber: formattedPhone,
         CallBackURL: process.env.DARAJA_CALLBACK_URL,
         AccountReference: accountRef,
@@ -334,14 +387,13 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
             }
         );
         response = stkRes.data;
-        console.log("📥 Daraja Response (Direct API):", response);
+        console.log("📥 Daraja Response:", response);
     } catch (err) {
         console.error('❌ Daraja STK Push failed:', err.response?.data || err.message);
         const errorMsg = err.response?.data?.errorMessage || err.response?.data?.ResponseDescription || 'Daraja STK push failed';
         throw new Error(errorMsg);
     }
 
-    // 5. Check for Success and Save Transaction
     if (response.ResponseCode !== '0') {
         const errorMsg = response.ResponseDescription || 'Daraja STK push failed';
         throw new Error(errorMsg);
@@ -354,6 +406,8 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
         name: name || 'Daraja Payment',
         phone: formattedPhone,
         amount: parseFloat(amount).toFixed(2),
+        bundle_sku: bundleSku || undefined,
+        source: source || undefined,
         checkout_id: checkoutId,
         merchant_request_id: merchantRequestId,
         retryCount: retryCount,
@@ -364,31 +418,45 @@ async function initiateStkPush(name, phone, amount, retryCount = 0) {
 }
 
 /* -------------------------------
+   10b. Input Validation (← ADDED)
+-------------------------------- */
+function validatePaymentInput(body) {
+    const { name, phone, amount } = body || {};
+
+    if (typeof name !== 'string' || name.trim().length === 0 || name.length > 100) {
+        return { ok: false, error: 'Invalid name' };
+    }
+    if (typeof phone !== 'string') {
+        return { ok: false, error: 'Phone must be a string' };
+    }
+    const cleanPhone = phone.replace(/\s+/g, '').replace(/^\+/, '').replace(/^0/, '254');
+    if (!/^254\d{9}$/.test(cleanPhone)) {
+        return { ok: false, error: 'Invalid phone number (expected 254XXXXXXXXX)' };
+    }
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0 || amt > 100000) {
+        return { ok: false, error: 'Invalid amount (must be 1–100,000)' };
+    }
+    return { ok: true, cleanPhone, amt };
+}
+
+/* -------------------------------
    11. Initiate Payment
 -------------------------------- */
 app.post("/api/pay", async (req, res) => {
     try {
-        const { name, phone, amount } = req.body;
-        if (!name || !phone || !amount) {
-            return res.status(400).json({ error: "Name, phone and amount required" });
-        }
+        const v = validatePaymentInput(req.body);
+        if (!v.ok) return res.status(400).json({ error: v.error });
 
-        let formattedPhone = phone
-            .replace(/\s+/g, '')
-            .replace(/^\+/, '')
-            .replace(/^0/, '254');
+        const { name, bundle_sku, source } = req.body;
 
-        const lastTx = await Transaction.findOne({ phone: formattedPhone })
+        const lastTx = await Transaction.findOne({ phone: v.cleanPhone })
             .sort({ createdAt: -1 });
 
-        // 30-second timeout for pending transactions
         if (lastTx && lastTx.status === "PENDING") {
             const secondsSince = (Date.now() - new Date(lastTx.createdAt).getTime()) / 1000;
             if (secondsSince > 30) {
-                await Transaction.updateOne(
-                    { _id: lastTx._id },
-                    { status: "FAILED" }
-                );
+                await Transaction.updateOne({ _id: lastTx._id }, { status: "FAILED" });
                 console.log(`Auto-cleaned stale pending transaction ${lastTx._id} after 30s`);
             } else {
                 return res.status(409).json({
@@ -397,7 +465,6 @@ app.post("/api/pay", async (req, res) => {
             }
         }
 
-        // Retry limit handling (max 5 attempts)
         if (lastTx && (lastTx.status === "FAILED" || lastTx.status === "CANCELLED")) {
             const retryCount = lastTx.retryCount || 0;
             const secondsSinceLast = (Date.now() - new Date(lastTx.lastRetryAt || lastTx.createdAt).getTime()) / 1000;
@@ -413,7 +480,15 @@ app.post("/api/pay", async (req, res) => {
             }
         }
 
-        const tx = await initiateStkPush(name, formattedPhone, amount, lastTx?.retryCount || 0);
+        const tx = await initiateStkPush(
+            name,
+            v.cleanPhone,
+            String(v.amt),
+            lastTx?.retryCount || 0,
+            bundle_sku,
+            source
+        );
+
         res.status(201).json({
             message: "STK Push Sent",
             transactionId: tx._id
@@ -434,17 +509,14 @@ app.post("/api/pay", async (req, res) => {
 app.post("/api/retry-payment", async (req, res) => {
     try {
         const { phone } = req.body;
-        if (!phone) {
+        if (!phone || typeof phone !== 'string') {
             return res.status(400).json({ error: "Phone number required" });
         }
 
-        let formattedPhone = phone
-            .replace(/\s+/g, '')
-            .replace(/^\+/, '')
-            .replace(/^0/, '254');
+        const cleanPhone = phone.replace(/\s+/g, '').replace(/^\+/, '').replace(/^0/, '254');
 
         const lastTx = await Transaction.findOne({
-            phone: formattedPhone,
+            phone: cleanPhone,
             status: { $in: ["PENDING", "FAILED", "CANCELLED"] }
         }).sort({ createdAt: -1 });
 
@@ -472,9 +544,11 @@ app.post("/api/retry-payment", async (req, res) => {
 
         const newTx = await initiateStkPush(
             lastTx.name,
-            formattedPhone,
+            cleanPhone,
             lastTx.amount,
-            retryCount + 1
+            retryCount + 1,
+            lastTx.bundle_sku,
+            lastTx.source
         );
 
         res.status(201).json({
@@ -485,10 +559,7 @@ app.post("/api/retry-payment", async (req, res) => {
 
     } catch (error) {
         console.error("Retry payment error:", error);
-        res.status(500).json({
-            error: "Failed to retry payment",
-            details: error.message
-        });
+        res.status(500).json({ error: "Failed to retry payment", details: error.message });
     }
 });
 
@@ -502,7 +573,6 @@ app.post("/api/query-stk", async (req, res) => {
             return res.status(400).json({ error: "checkoutRequestId required" });
         }
 
-        // 1. Get OAuth Access Token
         const auth = Buffer.from(
             `${process.env.DARAJA_CONSUMER_KEY}:${process.env.DARAJA_CONSUMER_SECRET}`
         ).toString('base64');
@@ -513,13 +583,11 @@ app.post("/api/query-stk", async (req, res) => {
         );
         const accessToken = tokenRes.data.access_token;
 
-        // 2. Generate Timestamp and Password
         const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
         const password = Buffer.from(
             `${process.env.DARAJA_SHORTCODE}${process.env.DARAJA_PASSKEY}${timestamp}`
         ).toString('base64');
 
-        // 3. Query the status
         const queryPayload = {
             BusinessShortCode: process.env.DARAJA_SHORTCODE,
             Password: password,
@@ -551,7 +619,7 @@ app.post("/api/query-stk", async (req, res) => {
 });
 
 /* -------------------------------
-   13. Fetch Transactions (paginated)
+   13. Fetch Transactions (paginated) — ADMIN PROTECTED
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -559,7 +627,13 @@ app.get("/api/transactions", async (req, res) => {
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
         const status = (req.query.status || '').toUpperCase();
         const phone = (req.query.phone || '').trim();
-        const search = (req.query.search || '').trim();
+
+        // ← ADDED: escape regex metacharacters + cap length (ReDoS fix)
+        const rawSearch = (req.query.search || '').trim();
+        const search = rawSearch.length > 100
+            ? rawSearch.slice(0, 100)
+            : rawSearch;
+        const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
         const filter = {};
         if (status && ['PENDING', 'SUCCESS', 'FAILED', 'CANCELLED'].includes(status)) {
@@ -568,12 +642,12 @@ app.get("/api/transactions", async (req, res) => {
         if (phone) {
             filter.phone = phone.replace(/\s+/g, '');
         }
-        if (search) {
+        if (escapedSearch) {
             filter.$or = [
-                { name: { $regex: search, $options: 'i' } },
-                { phone: { $regex: search, $options: 'i' } },
-                { mpesa_receipt: { $regex: search, $options: 'i' } },
-                { checkout_id: { $regex: search, $options: 'i' } }
+                { name: { $regex: escapedSearch, $options: 'i' } },
+                { phone: { $regex: escapedSearch, $options: 'i' } },
+                { mpesa_receipt: { $regex: escapedSearch, $options: 'i' } },
+                { checkout_id: { $regex: escapedSearch, $options: 'i' } }
             ];
         }
 
@@ -593,10 +667,7 @@ app.get("/api/transactions", async (req, res) => {
         res.json({
             data: transactions,
             pagination: {
-                page,
-                limit,
-                total,
-                totalPages,
+                page, limit, total, totalPages,
                 hasNext: page < totalPages,
                 hasPrev: page > 1
             }
@@ -608,7 +679,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 /* -------------------------------
-   14. Get Single Transaction by ID
+   14. Get Single Transaction by ID — ADMIN PROTECTED
 -------------------------------- */
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -623,36 +694,29 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   15. Daraja Payment Callback (Webhook)
+   15. Daraja Payment Callback (Webhook) — IP WHITELISTED
 -------------------------------- */
-app.post("/callback", async (req, res) => {
-    console.log("========================================");
-    console.log("🔔 DARAJA CALLBACK RECEIVED");
-    console.log("📌 Content-Type:", req.headers["content-type"]);
-    console.log("📌 Body:", JSON.stringify(req.body, null, 2));
-    console.log("========================================");
+app.post("/callback", callbackIpCheck, async (req, res) => {
+    // ← CHANGED: log only CheckoutRequestID + ResultCode (PII-safe)
+    const cb = req.body?.Body?.stkCallback;
+    console.log(`🔔 Callback: ${cb?.CheckoutRequestID || 'unknown'} → ResultCode ${cb?.ResultCode}`);
 
-    // Always respond with 200 immediately — Daraja retries aggressively on non-200
+    // Respond 200 immediately — Daraja retries aggressively on non-200
     res.sendStatus(200);
 
-    // Process asynchronously
     (async () => {
         try {
-            const callback = req.body?.Body?.stkCallback;
-            if (!callback) {
-                console.error("❌ Invalid Daraja callback structure (missing Body.stkCallback)");
+            if (!cb) {
+                console.error("❌ Invalid callback structure");
                 return;
             }
 
-            const checkoutId = callback.CheckoutRequestID;
-            const merchantRequestId = callback.MerchantRequestID;
-            const resultCode = callback.ResultCode;
-            const resultDesc = callback.ResultDesc;
+            const checkoutId = cb.CheckoutRequestID;
+            const merchantRequestId = cb.MerchantRequestID;
+            const resultCode = cb.ResultCode;
+            const resultDesc = cb.ResultDesc;
 
-            console.log(`📊 ResultCode: ${resultCode}, Desc: ${resultDesc}`);
-            console.log(`📊 CheckoutRequestID: ${checkoutId}`);
-
-            const items = callback.CallbackMetadata?.Item || [];
+            const items = cb.CallbackMetadata?.Item || [];
             const getItem = (name) => items.find(i => i.Name === name)?.Value;
             const receipt = getItem('MpesaReceiptNumber');
             const phone = getItem('PhoneNumber');
@@ -661,25 +725,18 @@ app.post("/callback", async (req, res) => {
             const status = Number(resultCode) === 0 ? 'SUCCESS' : 'FAILED';
 
             let transaction = null;
-
             if (checkoutId) {
                 transaction = await Transaction.findOne({ checkout_id: checkoutId });
-                if (transaction) console.log(`✅ Found by CheckoutRequestID: ${checkoutId}`);
             }
-
             if (!transaction && merchantRequestId) {
                 transaction = await Transaction.findOne({ merchant_request_id: merchantRequestId });
-                if (transaction) console.log(`✅ Found by MerchantRequestID: ${merchantRequestId}`);
             }
-
             if (!transaction && phone && amount) {
                 transaction = await Transaction.findOne({
                     phone: String(phone),
                     amount: String(amount)
                 }).sort({ createdAt: -1 });
-                if (transaction) console.log(`✅ Found by phone + amount: ${phone} / ${amount}`);
             }
-
             if (!transaction) {
                 console.error(`❌ No transaction found for CheckoutRequestID: ${checkoutId}`);
                 return;
@@ -692,12 +749,10 @@ app.post("/callback", async (req, res) => {
             if (checkoutId) transaction.checkout_id = checkoutId;
             if (merchantRequestId) transaction.merchant_request_id = merchantRequestId;
             await transaction.save();
-            console.log(`✅ Transaction ${transaction._id} updated to ${status}`);
+            console.log(`✅ Transaction ${transaction._id} → ${status}${receipt ? ` (${receipt})` : ''}`);
 
-            // ── Forward on success ──────────────────────────────────
+            // ── Forward on success ────────────────────────────────
             if (status === 'SUCCESS') {
-                // Unified payload — includes both snake_case and camelCase keys
-                // so downstream sites can read whichever they expect
                 const callbackPayload = {
                     transactionId: transaction._id,
                     checkoutId: transaction.checkout_id,
@@ -710,28 +765,26 @@ app.post("/callback", async (req, res) => {
                     amount: transaction.amount,
                     phone: transaction.phone,
                     name: transaction.name,
+                    bundle_sku: transaction.bundle_sku,
+                    source: transaction.source,
                     reference: checkoutId,
                     createdAt: transaction.createdAt
                 };
 
-                // Collect forwarding targets from env (comma-separated, deduped)
                 const rawUrls = [
-                    process.env.FORWARD_WEBHOOK_URLS,      // primary (recommended)
-                    process.env.RENTSPACE_WEBHOOK_URL,     // backward compat
-                    process.env.FINEESCORTS_WEBHOOK_URL    // backward compat
-                ]
-                    .filter(Boolean)
-                    .join(',');
+                    process.env.FORWARD_WEBHOOK_URLS,
+                    process.env.RENTSPACE_WEBHOOK_URL,
+                    process.env.FINEESCORTS_WEBHOOK_URL
+                ].filter(Boolean).join(',');
 
                 const webhookUrls = [...new Set(
                     rawUrls.split(',').map(u => u.trim()).filter(Boolean)
                 )];
 
                 if (!webhookUrls.length) {
-                    console.log('ℹ️  No forwarding webhooks configured — skipping forward');
+                    console.log('ℹ️  No forwarding webhooks configured');
                 }
 
-                // Optional shared secret header for downstream auth
                 const forwardHeaders = process.env.FORWARD_WEBHOOK_SECRET
                     ? { 'x-api-secret': process.env.FORWARD_WEBHOOK_SECRET }
                     : {};
@@ -742,14 +795,14 @@ app.post("/callback", async (req, res) => {
                             timeout: 5000,
                             headers: forwardHeaders
                         });
-                        console.log(`✅ Forwarded callback to ${webhookUrl}`);
+                        console.log(`✅ Forwarded to ${webhookUrl}`);
                     } catch (err) {
-                        console.error(`❌ Failed to forward callback to ${webhookUrl}:`, err.message);
+                        console.error(`❌ Failed to forward to ${webhookUrl}:`, err.message);
                     }
                 }
             }
         } catch (err) {
-            console.error("❌ Error processing Daraja callback:", err);
+            console.error("❌ Error processing callback:", err);
         }
     })();
 });
