@@ -146,13 +146,16 @@ const checkSecret = (req, res, next) => {
 };
 
 /* -------------------------------
-   5. reCAPTCHA Verification
-   (graceful: only rejects if token present AND score low)
+   5. reCAPTCHA Verification (graceful + kill switch)
 -------------------------------- */
 const verifyRecaptcha = async (req, res, next) => {
+    if (process.env.RECAPTCHA_DISABLED === 'true') {
+        console.warn('⚠️  reCAPTCHA disabled via RECAPTCHA_DISABLED=true');
+        return next();
+    }
+
     const token = req.headers['x-recaptcha-token'] || req.body.recaptchaToken;
 
-    // ← CHANGED: if token missing, don't block — let rate limiter handle it
     if (!token) {
         console.warn('⚠️  Missing reCAPTCHA token — falling back to rate limits');
         return next();
@@ -171,16 +174,25 @@ const verifyRecaptcha = async (req, res, next) => {
             }
         );
 
+        console.log('reCAPTCHA full response:', JSON.stringify(verification.data));
+
         const { success, score } = verification.data;
+        const errorCodes = verification.data['error-codes'] || [];
+
+        if (errorCodes.length > 0) {
+            console.warn(`⚠️  reCAPTCHA config error (allowing through): ${errorCodes.join(', ')}`);
+            return next();
+        }
+
         if (!success || (typeof score === 'number' && score < 0.5)) {
-            console.log(`reCAPTCHA failed: success=${success}, score=${score}`);
+            console.log(`🚫 reCAPTCHA rejected: success=${success}, score=${score}`);
             return res.status(403).json({ error: "Bot detected. Please try again." });
         }
 
+        console.log(`✅ reCAPTCHA passed (score: ${score})`);
         next();
     } catch (error) {
-        // ← CHANGED: don't block legitimate payments on verification errors
-        console.error("reCAPTCHA verification error (allowing through):", error.message);
+        console.error("reCAPTCHA network error (allowing through):", error.message);
         next();
     }
 };
