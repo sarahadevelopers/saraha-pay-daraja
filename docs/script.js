@@ -24,7 +24,7 @@ const API_RETRY_URL = `${API_BASE}/api/retry-payment`;
 const API_SECRET = "103e07b75c0b3d874cd4376dd0e095729f66d4f268033061aa087df169acc4ac4";
 
 // ---------- reCAPTCHA site key (from Google) ----------
-const RECAPTCHA_SITE_KEY = "6LcKDGEtAAAAAJKAWjXB7j5bSIPvzz94wBWapTD5";
+const RECAPTCHA_SITE_KEY = "6LeRv_QtAAAAAJA7B6yizaa4gL6z-MK6XkGPkcdA";
 
 // Retry payment using /api/retry-payment endpoint
 async function retryPayment(phone) {
