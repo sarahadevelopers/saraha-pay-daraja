@@ -5,11 +5,23 @@ const axios = require('axios');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.set('trust proxy', 1);
+
+/* -------------------------------
+   0. Security headers (optional helmet)
+-------------------------------- */
+try {
+    const helmet = require('helmet');
+    app.use(helmet({ contentSecurityPolicy: false }));
+    console.log('📍 Security headers: ENABLED (helmet)');
+} catch (e) {
+    console.log('📍 Security headers: DISABLED (run: npm install helmet)');
+}
 
 /* -------------------------------
    1. MongoDB Connection
@@ -47,7 +59,7 @@ transactionSchema.index({ merchant_request_id: 1 });
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
 /* -------------------------------
-   3. Middleware – CORS + BODY PARSING
+   3. CORS + BODY PARSING
 -------------------------------- */
 const allowedOrigins = [
     'https://bingwasoko.co.ke',
@@ -75,10 +87,9 @@ app.use(cors({
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-app.use(express.static("docs"));
 
 /* -------------------------------
-   3b. Basic Auth for Admin
+   3b. Basic Auth for Admin (BEFORE static — see below)
 -------------------------------- */
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS;
@@ -99,13 +110,17 @@ const adminAuth = (req, res, next) => {
     return res.status(401).send('Invalid credentials');
 };
 
+// Admin auth MUST run before express.static — otherwise the file
+// at docs/admin.html gets served directly, bypassing auth entirely.
 app.use('/admin.html', adminAuth);
 app.use('/api/transactions', adminAuth);
 app.use('/api/transaction', adminAuth);
 
+// Static files last so admin.html can't be reached without auth above.
+app.use(express.static(path.join(__dirname, 'docs')));
+
 /* -------------------------------
    4. Shared Secret Check
-   (no origin bypass — every caller must send x-api-secret)
 -------------------------------- */
 const VALID_SECRETS = [
     process.env.API_SECRET,
@@ -129,8 +144,9 @@ const checkSecret = (req, res, next) => {
 
     next();
 };
+
 /* -------------------------------
-   5. reCAPTCHA Verification (graceful + kill switch)
+   5. reCAPTCHA Verification
 -------------------------------- */
 const verifyRecaptcha = async (req, res, next) => {
     if (process.env.RECAPTCHA_DISABLED === 'true') {
@@ -140,9 +156,10 @@ const verifyRecaptcha = async (req, res, next) => {
 
     const token = req.headers['x-recaptcha-token'] || req.body.recaptchaToken;
 
+    // Reject when token is missing — no silent fallback
     if (!token) {
-        console.warn('⚠️  Missing reCAPTCHA token — falling back to rate limits');
-        return next();
+        console.warn('❌ Missing reCAPTCHA token — rejecting request');
+        return res.status(403).json({ error: "reCAPTCHA verification required" });
     }
 
     try {
@@ -163,19 +180,30 @@ const verifyRecaptcha = async (req, res, next) => {
         const { success, score } = verification.data;
         const errorCodes = verification.data['error-codes'] || [];
 
+        // Google config errors (bad secret) are OUR problem, not the user's
         if (errorCodes.length > 0) {
+            if (errorCodes.includes('invalid-input-secret')) {
+                console.error('❌ reCAPTCHA secret is INVALID — check RECAPTCHA_SECRET env var');
+                return res.status(500).json({ error: "Server misconfiguration" });
+            }
             console.warn(`⚠️  reCAPTCHA config error (allowing through): ${errorCodes.join(', ')}`);
             return next();
         }
 
-        if (!success || (typeof score === 'number' && score < 0.5)) {
-            console.log(`🚫 reCAPTCHA rejected: success=${success}, score=${score}`);
+        if (!success) {
+            console.log(`🚫 reCAPTCHA failed: success=false, score=${score}`);
+            return res.status(403).json({ error: "Bot detected. Please try again." });
+        }
+
+        if (typeof score === 'number' && score < 0.5) {
+            console.log(`🚫 reCAPTCHA low score: ${score}`);
             return res.status(403).json({ error: "Bot detected. Please try again." });
         }
 
         console.log(`✅ reCAPTCHA passed (score: ${score})`);
         next();
     } catch (error) {
+        // Network error — allow through so Google outages don't kill payments
         console.error("reCAPTCHA network error (allowing through):", error.message);
         next();
     }
@@ -202,15 +230,39 @@ const globalRateLimit = (req, res, next) => {
     next();
 };
 
-app.use('/api/pay', checkSecret);
-app.use('/api/retry-payment', checkSecret);
-app.use('/api/pay', verifyRecaptcha);
-app.use('/api/retry-payment', verifyRecaptcha);
-app.use('/api/pay', globalRateLimit);
-app.use('/api/retry-payment', globalRateLimit);
+/* -------------------------------
+   6b. getClientIp helper (moved up — used by IP blocking and callback check)
+-------------------------------- */
+function getClientIp(req) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) {
+        const first = xff.split(',')[0].trim();
+        if (first) return first;
+    }
+    const cf = req.headers['cf-connecting-ip'];
+    if (cf) return cf.trim();
+    const realIp = req.headers['x-real-ip'];
+    if (realIp) return realIp.trim();
+    return req.ip || '';
+}
 
 /* -------------------------------
-   7. IP Blocking
+   6c. Middleware stack — now covers /api/query-stk too
+-------------------------------- */
+app.use('/api/pay', checkSecret);
+app.use('/api/retry-payment', checkSecret);
+app.use('/api/query-stk', checkSecret);
+
+app.use('/api/pay', verifyRecaptcha);
+app.use('/api/retry-payment', verifyRecaptcha);
+// NOTE: /api/query-stk doesn't get reCAPTCHA — internal tool, protected by secret + rate limit
+
+app.use('/api/pay', globalRateLimit);
+app.use('/api/retry-payment', globalRateLimit);
+app.use('/api/query-stk', globalRateLimit);
+
+/* -------------------------------
+   7. IP Blocking (now uses real client IP)
 -------------------------------- */
 const violationStore = new Map();
 
@@ -226,7 +278,7 @@ setInterval(() => {
 }, 60000);
 
 const checkBlocked = (req, res, next) => {
-    const ip = req.ip || req.connection.remoteAddress;
+    const ip = getClientIp(req);
     const now = Date.now();
     const data = violationStore.get(ip);
     if (data && data.blockUntil && data.blockUntil > now) {
@@ -240,11 +292,12 @@ const checkBlocked = (req, res, next) => {
 const paymentLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
     max: 3,
+    keyGenerator: (req) => getClientIp(req) || 'unknown',
     message: { error: "Too many payment requests from this IP. Please wait 5 minutes." },
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
-        const ip = req.ip || req.connection.remoteAddress;
+        const ip = getClientIp(req);
         const now = Date.now();
         const data = violationStore.get(ip) || { count: 0, firstViolationTime: now, blockUntil: null };
         data.count += 1;
@@ -274,35 +327,16 @@ app.get("/", (req, res) => {
 });
 
 /* -------------------------------
-   8b. Callback IP Whitelist (FIXED)
+   8b. Callback IP Whitelist
 -------------------------------- */
 const SAFARICOM_IPS = (process.env.SAFARICOM_CALLBACK_IPS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
-
-/**
- * Extract the real client IP.
- * On Render, `req.ip` returns an internal proxy IP (10.x.x.x).
- * The real client IP is in `X-Forwarded-For` (comma-separated, first = client).
- */
-function getClientIp(req) {
-    const xff = req.headers['x-forwarded-for'];
-    if (xff) {
-        const first = xff.split(',')[0].trim();
-        if (first) return first;
-    }
-    const cf = req.headers['cf-connecting-ip'];
-    if (cf) return cf.trim();
-    const realIp = req.headers['x-real-ip'];
-    if (realIp) return realIp.trim();
-    return req.ip || '';
-}
 
 const callbackIpCheck = (req, res, next) => {
     const realIp = getClientIp(req);
     const proxyIp = req.ip || '';
     const xff = req.headers['x-forwarded-for'] || '(none)';
 
-    // Always log both so we can diagnose in production
     console.log(`🔍 Callback IP check → real=${realIp} | proxy=${proxyIp} | xff=${xff}`);
 
     if (SAFARICOM_IPS.length === 0) {
@@ -332,9 +366,10 @@ console.log(`📍 Daraja Callback: ${process.env.DARAJA_CALLBACK_URL}`);
 console.log(`📍 Forward Webhooks: ${process.env.FORWARD_WEBHOOK_URLS || '(none configured)'}`);
 console.log(`📍 Admin Auth: ${ADMIN_PASS ? 'ENABLED' : 'DISABLED (set ADMIN_PASS!)'}`);
 console.log(`📍 Callback IP Whitelist: ${SAFARICOM_IPS.length ? SAFARICOM_IPS.join(',') : 'DISABLED (set SAFARICOM_CALLBACK_IPS)'}`);
+console.log(`📍 reCAPTCHA: ${process.env.RECAPTCHA_DISABLED === 'true' ? 'DISABLED' : 'ENABLED'}`);
 
 /* -------------------------------
-   10. Helper: Initiate STK Push (Direct API)
+   10. Helper: Initiate STK Push
 -------------------------------- */
 async function initiateStkPush(name, phone, amount, retryCount = 0, bundleSku = null, source = null) {
     let formattedPhone = phone
@@ -636,7 +671,7 @@ app.post("/api/query-stk", async (req, res) => {
 });
 
 /* -------------------------------
-   13. Fetch Transactions (paginated) — ADMIN PROTECTED
+   13. Fetch Transactions (paginated)
 -------------------------------- */
 app.get("/api/transactions", async (req, res) => {
     try {
@@ -693,7 +728,7 @@ app.get("/api/transactions", async (req, res) => {
 });
 
 /* -------------------------------
-   14. Get Single Transaction by ID — ADMIN PROTECTED
+   14. Get Single Transaction by ID
 -------------------------------- */
 app.get("/api/transaction/:id", async (req, res) => {
     try {
@@ -708,7 +743,7 @@ app.get("/api/transaction/:id", async (req, res) => {
 });
 
 /* -------------------------------
-   15. Daraja Payment Callback (Webhook) — IP WHITELISTED
+   15. Daraja Payment Callback
 -------------------------------- */
 app.post("/callback", callbackIpCheck, async (req, res) => {
     const cb = req.body?.Body?.stkCallback;
