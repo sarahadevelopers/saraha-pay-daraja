@@ -14,17 +14,27 @@ function setPayButton(disabled, text = null) {
     if (text !== null) btn.innerText = text;
 }
 
-// ---------- API Base URLs (Daraja) ----------
-// ← CHANGED: fixed hostname (sarahapay → saraha-pay). Must match Render's URL exactly.
+// ---------- API Base URLs ----------
 const API_BASE = "https://saraha-pay-daraja.onrender.com";
 const API_PAY_URL = `${API_BASE}/api/pay`;
 const API_RETRY_URL = `${API_BASE}/api/retry-payment`;
 
-// ---------- Shared secret (must match API_SECRET in Render) ----------
-const API_SECRET = "103e07b75c0b3d874cd4376dd0e095729f66d4f268033061aa087df169acc4ac4";
+// NOTE: No API_SECRET in this file anymore.
+// Browser calls are authenticated by reCAPTCHA (enforced server-side).
+// The shared secret is only used by server-to-server callers.
 
-// ---------- reCAPTCHA site key (from Google) ----------
+// ---------- reCAPTCHA site key ----------
 const RECAPTCHA_SITE_KEY = "6LeRv_QtAAAAAJA7B6yizaa4gL6z-MK6XkGPkcdA";
+
+// Helper: get a fresh reCAPTCHA token
+async function getRecaptchaToken(action) {
+    try {
+        return await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action });
+    } catch (err) {
+        console.error("reCAPTCHA execute error:", err);
+        return '';
+    }
+}
 
 // Retry payment using /api/retry-payment endpoint
 async function retryPayment(phone) {
@@ -36,13 +46,15 @@ async function retryPayment(phone) {
     showStatus("Retrying payment...", "blue");
 
     try {
+        const recaptchaToken = await getRecaptchaToken('retry_payment');
+
         const response = await fetch(API_RETRY_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "X-API-Secret": API_SECRET
+                "X-Recaptcha-Token": recaptchaToken
             },
-            body: JSON.stringify({ phone: phone })
+            body: JSON.stringify({ phone })
         });
         const data = await response.json();
 
@@ -132,20 +144,18 @@ async function handlePayment() {
     showStatus("Requesting M-Pesa prompt...", "blue");
 
     try {
-        // ---------- Get reCAPTCHA token (invisible) ----------
-        let recaptchaToken = '';
-        try {
-            recaptchaToken = await grecaptcha.execute(RECAPTCHA_SITE_KEY, { action: 'payment' });
-        } catch (captchaErr) {
-            console.error("reCAPTCHA error:", captchaErr);
-            // Continue anyway — backend may not require it
+        const recaptchaToken = await getRecaptchaToken('payment');
+
+        if (!recaptchaToken) {
+            showStatus("Security verification failed. Please refresh and try again.", "error");
+            setPayButton(false, "Pay Now");
+            return;
         }
 
         const response = await fetch(API_PAY_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "X-API-Secret": API_SECRET,
                 "X-Recaptcha-Token": recaptchaToken
             },
             body: JSON.stringify({ name, phone, amount })

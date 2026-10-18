@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 10000;
 app.set('trust proxy', 1);
 
 /* -------------------------------
-   0. Security headers (optional helmet)
+   0. Security headers
 -------------------------------- */
 try {
     const helmet = require('helmet');
@@ -89,7 +89,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 /* -------------------------------
-   3b. Basic Auth for Admin (BEFORE static — see below)
+   3b. Basic Auth for Admin (before static)
 -------------------------------- */
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS;
@@ -110,17 +110,17 @@ const adminAuth = (req, res, next) => {
     return res.status(401).send('Invalid credentials');
 };
 
-// Admin auth MUST run before express.static — otherwise the file
-// at docs/admin.html gets served directly, bypassing auth entirely.
 app.use('/admin.html', adminAuth);
 app.use('/api/transactions', adminAuth);
 app.use('/api/transaction', adminAuth);
 
-// Static files last so admin.html can't be reached without auth above.
+// Static files last so admin.html requires auth
 app.use(express.static(path.join(__dirname, 'docs')));
 
 /* -------------------------------
    4. Shared Secret Check
+   • Browser call from an allowed origin  → skip secret, rely on reCAPTCHA
+   • Server-to-server / unknown origin     → require x-api-secret
 -------------------------------- */
 const VALID_SECRETS = [
     process.env.API_SECRET,
@@ -129,14 +129,19 @@ const VALID_SECRETS = [
 ].filter(Boolean);
 
 const checkSecret = (req, res, next) => {
-    const secret = req.headers['x-api-secret'];
+    const origin = req.headers.origin || '';
 
-    if (!secret) {
-        const origin = req.headers.origin || req.headers.referer || '(none)';
-        console.warn(`❌ Missing API secret header (origin: ${origin})`);
-        return res.status(403).json({ error: "Missing API secret" });
+    // Browser call from a known site → reCAPTCHA gates this request
+    if (origin && allowedOrigins.includes(origin)) {
+        return next();
     }
 
+    // Server-to-server (or unknown origin) → require valid secret
+    const secret = req.headers['x-api-secret'];
+    if (!secret) {
+        console.warn(`❌ Missing API secret (origin: ${origin || '(none)'})`);
+        return res.status(403).json({ error: "Missing API secret" });
+    }
     if (!VALID_SECRETS.includes(secret)) {
         console.warn(`❌ Invalid API secret: ${secret.substring(0, 10)}...`);
         return res.status(403).json({ error: "Unauthorized" });
@@ -156,7 +161,6 @@ const verifyRecaptcha = async (req, res, next) => {
 
     const token = req.headers['x-recaptcha-token'] || req.body.recaptchaToken;
 
-    // Reject when token is missing — no silent fallback
     if (!token) {
         console.warn('❌ Missing reCAPTCHA token — rejecting request');
         return res.status(403).json({ error: "reCAPTCHA verification required" });
@@ -180,7 +184,6 @@ const verifyRecaptcha = async (req, res, next) => {
         const { success, score } = verification.data;
         const errorCodes = verification.data['error-codes'] || [];
 
-        // Google config errors (bad secret) are OUR problem, not the user's
         if (errorCodes.length > 0) {
             if (errorCodes.includes('invalid-input-secret')) {
                 console.error('❌ reCAPTCHA secret is INVALID — check RECAPTCHA_SECRET env var');
@@ -203,18 +206,17 @@ const verifyRecaptcha = async (req, res, next) => {
         console.log(`✅ reCAPTCHA passed (score: ${score})`);
         next();
     } catch (error) {
-        // Network error — allow through so Google outages don't kill payments
         console.error("reCAPTCHA network error (allowing through):", error.message);
         next();
     }
 };
 
 /* -------------------------------
-   6. Global Rate Limit
+   6. Global Rate Limit (circuit breaker — raised for production scale)
 -------------------------------- */
 let globalRequestCount = 0;
 let globalWindowStart = Date.now();
-const GLOBAL_MAX = 50;
+const GLOBAL_MAX = 500;   // ~8/sec — safety valve, not a blocker
 const GLOBAL_WINDOW = 60 * 1000;
 
 const globalRateLimit = (req, res, next) => {
@@ -225,13 +227,14 @@ const globalRateLimit = (req, res, next) => {
     }
     globalRequestCount++;
     if (globalRequestCount > GLOBAL_MAX) {
-        return res.status(429).json({ error: "Global request limit reached. Please try again later." });
+        console.warn(`⚠️  GLOBAL RATE LIMIT TRIPPED: ${globalRequestCount}/${GLOBAL_WINDOW}ms`);
+        return res.status(429).json({ error: "Service temporarily busy. Please try again shortly." });
     }
     next();
 };
 
 /* -------------------------------
-   6b. getClientIp helper (moved up — used by IP blocking and callback check)
+   6b. getClientIp helper
 -------------------------------- */
 function getClientIp(req) {
     const xff = req.headers['x-forwarded-for'];
@@ -247,7 +250,58 @@ function getClientIp(req) {
 }
 
 /* -------------------------------
-   6c. Middleware stack — now covers /api/query-stk too
+   6c. Per-phone rate limiter (NEW)
+   Prevents SMS bombing of a single number.
+   1 STK push per phone per 60 seconds.
+-------------------------------- */
+const phoneAttempts = new Map();   // normalized phone → [timestamps]
+const PHONE_WINDOW_MS = 60 * 1000;
+const PHONE_MAX = 1;
+
+const phoneLimiter = (req, res, next) => {
+    const rawPhone = req.body?.phone;
+    if (!rawPhone || typeof rawPhone !== 'string') {
+        return next();   // let validatePaymentInput handle invalid input
+    }
+
+    const phone = rawPhone
+        .replace(/\s+/g, '')
+        .replace(/^\+/, '')
+        .replace(/^0/, '254');
+
+    if (!/^254\d{9}$/.test(phone)) {
+        return next();   // invalid phone — let validation handle it
+    }
+
+    const now = Date.now();
+    const attempts = (phoneAttempts.get(phone) || []).filter(t => now - t < PHONE_WINDOW_MS);
+
+    if (attempts.length >= PHONE_MAX) {
+        const oldest = attempts[0];
+        const waitSec = Math.ceil((PHONE_WINDOW_MS - (now - oldest)) / 1000);
+        console.warn(`🚫 Phone rate limit: ${phone} (wait ${waitSec}s)`);
+        return res.status(429).json({
+            error: `A payment was already requested for this number. Please wait ${waitSec} seconds.`
+        });
+    }
+
+    attempts.push(now);
+    phoneAttempts.set(phone, attempts);
+    next();
+};
+
+// Cleanup every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [phone, attempts] of phoneAttempts.entries()) {
+        const fresh = attempts.filter(t => now - t < PHONE_WINDOW_MS);
+        if (fresh.length === 0) phoneAttempts.delete(phone);
+        else phoneAttempts.set(phone, fresh);
+    }
+}, 5 * 60 * 1000);
+
+/* -------------------------------
+   6d. Middleware stack
 -------------------------------- */
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
@@ -255,14 +309,17 @@ app.use('/api/query-stk', checkSecret);
 
 app.use('/api/pay', verifyRecaptcha);
 app.use('/api/retry-payment', verifyRecaptcha);
-// NOTE: /api/query-stk doesn't get reCAPTCHA — internal tool, protected by secret + rate limit
+// /api/query-stk has no reCAPTCHA — server-side tool, secret + rate limit only
 
 app.use('/api/pay', globalRateLimit);
 app.use('/api/retry-payment', globalRateLimit);
 app.use('/api/query-stk', globalRateLimit);
 
+app.use('/api/pay', phoneLimiter);
+app.use('/api/retry-payment', phoneLimiter);
+
 /* -------------------------------
-   7. IP Blocking (now uses real client IP)
+   7. IP Blocking (CGNAT-safe limits)
 -------------------------------- */
 const violationStore = new Map();
 
@@ -291,7 +348,7 @@ const checkBlocked = (req, res, next) => {
 
 const paymentLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
-    max: 3,
+    max: 20,                          // raised from 3 → handles CGNAT
     keyGenerator: (req) => getClientIp(req) || 'unknown',
     message: { error: "Too many payment requests from this IP. Please wait 5 minutes." },
     standardHeaders: true,
@@ -301,11 +358,11 @@ const paymentLimiter = rateLimit({
         const now = Date.now();
         const data = violationStore.get(ip) || { count: 0, firstViolationTime: now, blockUntil: null };
         data.count += 1;
-        if (data.count >= 3) {
-            data.blockUntil = now + 3600000;
+        if (data.count >= 10) {        // raised from 3 → don't ban CGNAT neighbours too fast
+            data.blockUntil = now + 900000;  // 15 min (was 1 hour)
             violationStore.set(ip, data);
             res.status(429).json({
-                error: "Too many failed payment attempts. Your IP has been blocked for 1 hour."
+                error: "Too many failed payment attempts. Your IP has been blocked for 15 minutes."
             });
         } else {
             violationStore.set(ip, data);
@@ -367,6 +424,7 @@ console.log(`📍 Forward Webhooks: ${process.env.FORWARD_WEBHOOK_URLS || '(none
 console.log(`📍 Admin Auth: ${ADMIN_PASS ? 'ENABLED' : 'DISABLED (set ADMIN_PASS!)'}`);
 console.log(`📍 Callback IP Whitelist: ${SAFARICOM_IPS.length ? SAFARICOM_IPS.join(',') : 'DISABLED (set SAFARICOM_CALLBACK_IPS)'}`);
 console.log(`📍 reCAPTCHA: ${process.env.RECAPTCHA_DISABLED === 'true' ? 'DISABLED' : 'ENABLED'}`);
+console.log(`📍 Rate limits: global=${GLOBAL_MAX}/min, perIP=20/5min, perPhone=${PHONE_MAX}/${PHONE_WINDOW_MS/1000}s`);
 
 /* -------------------------------
    10. Helper: Initiate STK Push
