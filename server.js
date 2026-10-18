@@ -25,8 +25,8 @@ const transactionSchema = new mongoose.Schema({
     name: String,
     phone: String,
     amount: String,
-    bundle_sku: String,             // ← optional: which bundle (for site routing)
-    source: String,                 // ← optional: 'bingwasoko' | 'datasokoni'
+    bundle_sku: String,
+    source: String,
     status: { type: String, default: "PENDING" },
     checkout_id: String,
     merchant_request_id: String,
@@ -78,12 +78,10 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.static("docs"));
 
 /* -------------------------------
-   3b. Basic Auth for Admin (← ADDED)
+   3b. Basic Auth for Admin
 -------------------------------- */
-// Protects /admin.html, /api/transactions, /api/transaction/:id
-// Uses HTTP Basic — browsers prompt for username/password
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASS;  // must be set in Render env
+const ADMIN_PASS = process.env.ADMIN_PASS;
 
 const adminAuth = (req, res, next) => {
     if (!ADMIN_PASS) {
@@ -101,7 +99,6 @@ const adminAuth = (req, res, next) => {
     return res.status(401).send('Invalid credentials');
 };
 
-// Protect admin page + read endpoints
 app.use('/admin.html', adminAuth);
 app.use('/api/transactions', adminAuth);
 app.use('/api/transaction', adminAuth);
@@ -220,7 +217,7 @@ const globalRateLimit = (req, res, next) => {
 
 app.use('/api/pay', checkSecret);
 app.use('/api/retry-payment', checkSecret);
-app.use('/api/pay', verifyRecaptcha);            // ← ENABLED (graceful)
+app.use('/api/pay', verifyRecaptcha);
 app.use('/api/retry-payment', verifyRecaptcha);
 app.use('/api/pay', globalRateLimit);
 app.use('/api/retry-payment', globalRateLimit);
@@ -290,24 +287,45 @@ app.get("/", (req, res) => {
 });
 
 /* -------------------------------
-   8b. Callback IP Whitelist (← ADDED)
-   Set SAFARICOM_CALLBACK_IPS in env to enforce.
-   Format: comma-separated prefixes, e.g. "196.201.214.,196.201.213."
-   If unset, only warns (so you can observe real IPs before enforcing).
+   8b. Callback IP Whitelist (FIXED)
 -------------------------------- */
 const SAFARICOM_IPS = (process.env.SAFARICOM_CALLBACK_IPS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
 
+/**
+ * Extract the real client IP.
+ * On Render, `req.ip` returns an internal proxy IP (10.x.x.x).
+ * The real client IP is in `X-Forwarded-For` (comma-separated, first = client).
+ */
+function getClientIp(req) {
+    const xff = req.headers['x-forwarded-for'];
+    if (xff) {
+        const first = xff.split(',')[0].trim();
+        if (first) return first;
+    }
+    const cf = req.headers['cf-connecting-ip'];
+    if (cf) return cf.trim();
+    const realIp = req.headers['x-real-ip'];
+    if (realIp) return realIp.trim();
+    return req.ip || '';
+}
+
 const callbackIpCheck = (req, res, next) => {
-    const ip = req.ip || '';
+    const realIp = getClientIp(req);
+    const proxyIp = req.ip || '';
+    const xff = req.headers['x-forwarded-for'] || '(none)';
+
+    // Always log both so we can diagnose in production
+    console.log(`🔍 Callback IP check → real=${realIp} | proxy=${proxyIp} | xff=${xff}`);
+
     if (SAFARICOM_IPS.length === 0) {
-        console.warn(`⚠️  Callback from ${ip} (IP whitelist disabled — set SAFARICOM_CALLBACK_IPS to enforce)`);
+        console.warn(`⚠️  IP whitelist DISABLED — allowing callback from ${realIp}`);
         return next();
     }
-    if (SAFARICOM_IPS.some(prefix => ip.startsWith(prefix))) {
+    if (SAFARICOM_IPS.some(prefix => realIp.startsWith(prefix))) {
         return next();
     }
-    console.warn(`🚫 Blocked callback from non-Safaricom IP: ${ip}`);
+    console.warn(`🚫 Blocked callback from non-Safaricom IP: ${realIp} (xff=${xff})`);
     return res.status(403).send('Forbidden');
 };
 
@@ -430,7 +448,7 @@ async function initiateStkPush(name, phone, amount, retryCount = 0, bundleSku = 
 }
 
 /* -------------------------------
-   10b. Input Validation (← ADDED)
+   10b. Input Validation
 -------------------------------- */
 function validatePaymentInput(body) {
     const { name, phone, amount } = body || {};
@@ -640,11 +658,8 @@ app.get("/api/transactions", async (req, res) => {
         const status = (req.query.status || '').toUpperCase();
         const phone = (req.query.phone || '').trim();
 
-        // ← ADDED: escape regex metacharacters + cap length (ReDoS fix)
         const rawSearch = (req.query.search || '').trim();
-        const search = rawSearch.length > 100
-            ? rawSearch.slice(0, 100)
-            : rawSearch;
+        const search = rawSearch.length > 100 ? rawSearch.slice(0, 100) : rawSearch;
         const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
         const filter = {};
@@ -709,11 +724,9 @@ app.get("/api/transaction/:id", async (req, res) => {
    15. Daraja Payment Callback (Webhook) — IP WHITELISTED
 -------------------------------- */
 app.post("/callback", callbackIpCheck, async (req, res) => {
-    // ← CHANGED: log only CheckoutRequestID + ResultCode (PII-safe)
     const cb = req.body?.Body?.stkCallback;
     console.log(`🔔 Callback: ${cb?.CheckoutRequestID || 'unknown'} → ResultCode ${cb?.ResultCode}`);
 
-    // Respond 200 immediately — Daraja retries aggressively on non-200
     res.sendStatus(200);
 
     (async () => {
@@ -763,7 +776,6 @@ app.post("/callback", callbackIpCheck, async (req, res) => {
             await transaction.save();
             console.log(`✅ Transaction ${transaction._id} → ${status}${receipt ? ` (${receipt})` : ''}`);
 
-            // ── Forward on success ────────────────────────────────
             if (status === 'SUCCESS') {
                 const callbackPayload = {
                     transactionId: transaction._id,
