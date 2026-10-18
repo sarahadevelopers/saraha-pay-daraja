@@ -105,14 +105,8 @@ app.use('/api/transaction', adminAuth);
 
 /* -------------------------------
    4. Shared Secret Check
+   (no origin bypass — every caller must send x-api-secret)
 -------------------------------- */
-const SKIP_SECRET_DOMAINS = [
-    'https://bingwasoko.co.ke',
-    'https://www.bingwasoko.co.ke',
-    'https://datasokoni.com',
-    'https://www.datasokoni.com'
-];
-
 const VALID_SECRETS = [
     process.env.API_SECRET,
     process.env.API_SECRET_BINGWA,
@@ -120,17 +114,11 @@ const VALID_SECRETS = [
 ].filter(Boolean);
 
 const checkSecret = (req, res, next) => {
-    const origin = req.headers.origin || req.headers.referer || '';
     const secret = req.headers['x-api-secret'];
 
-    const isTrustedDomain = SKIP_SECRET_DOMAINS.some(domain => origin.startsWith(domain));
-    if (isTrustedDomain) {
-        console.log(`✅ Skipping secret check for trusted domain: ${origin}`);
-        return next();
-    }
-
     if (!secret) {
-        console.warn('❌ Missing API secret header');
+        const origin = req.headers.origin || req.headers.referer || '(none)';
+        console.warn(`❌ Missing API secret header (origin: ${origin})`);
         return res.status(403).json({ error: "Missing API secret" });
     }
 
@@ -141,7 +129,6 @@ const checkSecret = (req, res, next) => {
 
     next();
 };
-
 /* -------------------------------
    5. reCAPTCHA Verification (graceful + kill switch)
 -------------------------------- */
