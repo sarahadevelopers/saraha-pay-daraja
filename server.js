@@ -47,6 +47,14 @@ const transactionSchema = new mongoose.Schema({
     result_desc: String,
     retryCount: { type: Number, default: 0 },
     lastRetryAt: { type: Date, default: null },
+
+    // ── Delivery worker fields (added for Android Automate integration) ──
+    delivered:         { type: Boolean, default: false },
+    delivery_status:   { type: String, default: null },
+    delivery_attempts: { type: Number, default: 0 },
+    delivered_at:      { type: Date, default: null },
+    delivery_error:    { type: String, default: null },
+
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -55,6 +63,7 @@ transactionSchema.index({ phone: 1, createdAt: -1 });
 transactionSchema.index({ status: 1, createdAt: -1 });
 transactionSchema.index({ checkout_id: 1 });
 transactionSchema.index({ merchant_request_id: 1 });
+transactionSchema.index({ delivery_status: 1, delivered: 1, createdAt: 1 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
@@ -403,7 +412,7 @@ const callbackIpCheck = (req, res, next) => {
     if (SAFARICOM_IPS.some(prefix => realIp.startsWith(prefix))) {
         return next();
     }
-    console.warn(`🚫 Blocked callback from non-Safaricom IP: ${realIp} (xff=${xff})`);
+    console.warn(`🚫 Blocked callback from non-Safarcom IP: ${realIp} (xff=${xff})`);
     return res.status(403).send('Forbidden');
 };
 
@@ -857,6 +866,11 @@ app.post("/callback", callbackIpCheck, async (req, res) => {
             console.log(`✅ Transaction ${transaction._id} → ${status}${receipt ? ` (${receipt})` : ''}`);
 
             if (status === 'SUCCESS') {
+                // ── Mark for the delivery worker (Android Automate) ──
+                transaction.delivery_status = 'PENDING';
+                await transaction.save();
+                console.log(`📦 Delivery queued for ${transaction._id}`);
+
                 const callbackPayload = {
                     transactionId: transaction._id,
                     checkoutId: transaction.checkout_id,
@@ -909,6 +923,84 @@ app.post("/callback", callbackIpCheck, async (req, res) => {
             console.error("❌ Error processing callback:", err);
         }
     })();
+});
+
+/* -------------------------------
+   15b. Delivery worker endpoints
+   Polled by the Android Automate app
+   Requires x-api-secret header (always — no origin bypass)
+-------------------------------- */
+const requireDeliverySecret = (req, res, next) => {
+    const secret = req.headers['x-api-secret'];
+    if (!secret || secret !== process.env.API_SECRET) {
+        console.warn(`❌ Delivery auth failed (secret: ${secret ? secret.substring(0, 10) + '...' : 'none'})`);
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+    next();
+};
+
+app.get('/api/delivery/pending', requireDeliverySecret, async (req, res) => {
+    try {
+        const tx = await Transaction.findOne({
+            status: 'SUCCESS',
+            delivered: false,
+            delivery_status: 'PENDING',
+            delivery_attempts: { $lt: 3 }
+        }).sort({ createdAt: 1 }).lean();   // FIFO — oldest first
+
+        if (!tx) return res.status(204).send();
+
+        res.json({
+            orderId: tx._id.toString(),
+            phone: tx.phone,
+            bundleSku: tx.bundle_sku,
+            amount: tx.amount,
+            attempt: (tx.delivery_attempts || 0) + 1
+        });
+    } catch (err) {
+        console.error('delivery/pending:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/delivery/complete', requireDeliverySecret, async (req, res) => {
+    try {
+        const { orderId, status, error } = req.body || {};
+        if (!orderId || !['DELIVERED', 'FAILED'].includes(status)) {
+            return res.status(400).json({ error: 'orderId and status=DELIVERED|FAILED required' });
+        }
+
+        const tx = await Transaction.findById(orderId);
+        if (!tx) return res.status(404).json({ error: 'Order not found' });
+
+        if (status === 'DELIVERED') {
+            tx.delivered = true;
+            tx.delivery_status = 'DELIVERED';
+            tx.delivered_at = new Date();
+            tx.delivery_error = null;
+        } else {
+            tx.delivery_attempts = (tx.delivery_attempts || 0) + 1;
+            if (tx.delivery_attempts >= 3) {
+                tx.delivery_status = 'FAILED';   // permanent — needs manual fix
+                tx.delivery_error = error || 'Max attempts reached';
+            } else {
+                tx.delivery_status = 'PENDING';  // retry on next poll
+                tx.delivery_error = error || 'Retry pending';
+            }
+        }
+        await tx.save();
+
+        console.log(`📦 ${orderId} → ${status} (attempt ${tx.delivery_attempts})`);
+        res.json({
+            ok: true,
+            orderId,
+            delivery_status: tx.delivery_status,
+            attempts: tx.delivery_attempts
+        });
+    } catch (err) {
+        console.error('delivery/complete:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 /* -------------------------------
