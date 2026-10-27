@@ -79,6 +79,8 @@ const allowedOrigins = [
     'https://www.fineescorts.co.ke',
     'https://sarahadevelopers.github.io',
     'http://localhost:3000',
+    'http://localhost:5505',
+    'http://127.0.0.1:5505',
     'https://fine-2zxp.onrender.com',
     'https://rentspace.co.ke',
     'https://www.rentspace.co.ke',
